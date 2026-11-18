@@ -1,7 +1,5 @@
-Here are 3 different ways to create a synthetic dataset.  
-1st.  This is a VAE and it models the residuals from slopes and intercepts and adds this noise back into the VAE's mean estimates.  This helps keep the within correlation in the synthetic 
-dataset similar to the real one.
-2nd This attempts to model the dependencies over time directly with a Joint VAE.  
-3rd.  This uses a python package CPAR which generates synthetic data through conditional neural networks.  
-Results are similar across synthetic generation.  
-However when assessing if inferences hold up, the 1st method does the best on the Corsano Dataset.
+I compared three ways to generate synthetic longitudinal data.
+(1) VAE with noise added after: a conditional VAE generates each patient’s mean trajectory. Per variable, a mixed model (random intercept and slope, plus AR(1)) is fitted to the VAE’s reconstruction residuals, and that noise is added back to the synthetic means, preserving each patient’s within-person variation over time.
+(2) Joint VAE: a sequential VAE that models dependence over time directly, through a daily latent variable with an AR(1) prior and a learned variance.
+(3) SDV PARSynthesizer: a Python package that generates each patient day by day with an autoregressive neural network conditioned on patient traits.
+On distribution-level similarity, the three methods were comparable (S_pMSE 21–26), although PAR preserved correlations between variables less well. When I tested whether inferences from the PART 4 spline mixed models hold up from my previous research in IBD, method 1 performed best on the Corsano dataset: CI overlap of estimated means 0.80 vs 0.64 and 0.58, and the most matching significance calls (84% between-class, 80% within-class, 75% covariates).
