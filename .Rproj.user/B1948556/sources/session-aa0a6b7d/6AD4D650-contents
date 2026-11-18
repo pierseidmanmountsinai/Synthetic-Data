@@ -1,0 +1,663 @@
+---
+title: "PART 3 - PBC Synthetic Data Assessment"
+author: "Piers Seidman"
+date: "2026-11-11"
+output: html_document
+---
+
+Assesses one synthetic version of the Mayo PBC data (`survival::pbcseq`), made with the PART 1 generator.
+Each section asks one question about the synthetic data, in this order:
+
+1. Real data
+2. Generate synthetic data
+3. Visits and missing values: are the visit pattern and the gaps the same?
+4. Patient traits: same mix of treatment / sex / age, without copying real patients?
+5. Distributions: does each variable look the same on its own?
+6. Correlations: do the labs move together the same way?
+7. Trajectories: same change over time?
+8. Within-patient structure: same patient-to-patient spread, slopes and visit-to-visit correlation?
+9. Model transfer: does the PBC model give the same answer on synthetic data?
+10. Overall utility and privacy
+11. Summary
+
+
+```{r libraries, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+library(reticulate)
+py_require(python_version = "3.12")   # must run before keras3 on Windows
+
+# Generator (PART 1)
+library(keras3)        # Temporal VAE
+library(tidyverse)     # dplyr, tidyr, purrr, ggplot2 (the generator needs all of them)
+library(car)           # Box-Cox
+library(lme4)          # noise structure inside the generator
+library(synthpop)      # synthetic traits (generator) + utility S_pMSE
+
+# Data & models
+library(survival)      # pbcseq data
+library(nlme)          # Linear mixed-effects models
+library(splines)       # Natural cubic splines ns()
+library(emmeans)       # Marginal means
+
+# Visualization
+library(patchwork)     # Combine plots
+```
+
+
+```{r directories}
+main.dir    <- "C:/Users/seidmp03/OneDrive - The Mount Sinai Hospital/Synthetic Data"
+part1_file  <- file.path(main.dir, "PART_1_Synthetic_Data_Generator.Rmd")   # generator code
+results.dir <- file.path(main.dir, "PART_3_PBC_Assessment")                 # outputs of this file
+dir.create(results.dir, recursive = TRUE, showWarnings = FALSE)
+
+syn_file <- file.path(results.dir, "pbc_synthetic_seed_1.rds")   # saved synthetic data
+```
+
+
+```{r load generator}
+# Load the generator functions from PART 1 (only the 3 generator chunks, not the JJ chunks)
+rmd <- readLines(part1_file)
+
+# pull the code of one chunk by its label
+chunk_code <- function(label) {
+  start <- grep(paste0("^```\\{r ", label), rmd)   # line where the chunk opens
+  end   <- grep("^```\\s*$", rmd)                  # all lines that close a chunk
+  end   <- end[end > start][1]                     # first close after the open
+  rmd[(start + 1):(end - 1)]                       # code between them
+}
+
+# run the 3 generator chunks
+walk(c("generator-main", "generator-model", "generator-helpers"),
+     ~ eval(parse(text = chunk_code(.x)), envir = globalenv()))
+```
+
+
+## 1. Real data
+
+Mayo PBC trial: 312 patients, labs at irregular visits, two treatment arms (`trt`: D-penicillamine vs placebo).
+
+```{r load data}
+# DATA CHANGES: time = half-years since entry (rounded); codes made factors; the event / derived columns are dropped;
+# two visits in the same half-year are combined into one (labs averaged, categories from the later visit)
+pbc_real <- pbcseq %>%
+  transmute(patient_id = id,
+            t = round(day / 182.625),            # days -> half-years
+            trt = factor(trt),
+            sex = factor(sex),
+            age,
+            bili, albumin, alk.phos, ast, platelet, protime, chol,
+            ascites = factor(ascites),
+            hepato  = factor(hepato),
+            spiders = factor(spiders),
+            edema   = factor(edema))
+n_before <- nrow(pbc_real)
+
+# ---- Two visits in the same half-year -> one row ----
+pbc_real <- pbc_real %>%
+  group_by(patient_id, t) %>%
+  summarise(across(c(trt, sex, age), first),                                                        # traits: same in both
+            across(c(bili, albumin, alk.phos, ast, platelet, protime, chol), ~ mean(.x, na.rm = TRUE)),  # labs: average
+            across(c(ascites, hepato, spiders, edema), ~ last(na.omit(.x))),                         # categories: later visit
+            .groups = "drop") %>%
+  mutate(across(c(bili, albumin, alk.phos, ast, platelet, protime, chol),
+                ~ replace(.x, is.nan(.x), NA)))                                                    # both missing -> NA
+cat("DATA CHANGE:", n_before - nrow(pbc_real), "pairs of visits in the same half-year combined into one\n")
+
+# variable groups used below
+traits <- c("trt", "sex", "age")
+labs   <- c("bili", "albumin", "alk.phos", "ast", "platelet", "protime", "chol")
+cats   <- c("ascites", "hepato", "spiders", "edema")
+```
+
+
+## 2. Generate synthetic data
+
+Generated once and saved; later knits read the saved file. Delete the file to generate again.
+
+```{r generate}
+if (file.exists(syn_file)) {
+  pbc_syn <- readRDS(syn_file)   # already made
+} else {
+  pbc_syn <- generate_synthetic_temporal_vae(pbc_real, seed = 1, verbose = 0, time_var = "t")
+  saveRDS(pbc_syn, syn_file)
+}
+
+# real and synthetic stacked, used by most sections below
+both <- bind_rows(Real = pbc_real, Synthetic = pbc_syn, .id = "source")
+```
+
+
+## 3. Visits and missing values
+
+```{r visit summary}
+# patients, visits, visits per patient, last visit
+visit_summary <- both %>%
+  group_by(source) %>%
+  summarise(patients = n_distinct(patient_id),
+            visits = n(),
+            visits_per_patient_median = median(table(patient_id)),
+            last_visit_median = median(tapply(t, patient_id, max)),   # half-years
+            .groups = "drop")
+print(visit_summary)
+```
+
+```{r missing summary}
+# % missing per variable
+missing_summary <- both %>%
+  group_by(source) %>%
+  summarise(across(all_of(c(labs, cats)), ~ round(100 * mean(is.na(.x)), 1)),
+            .groups = "drop") %>%
+  pivot_longer(-source, names_to = "variable", values_to = "pct_missing") %>%   # one row per source and variable
+  pivot_wider(names_from = source, values_from = pct_missing)                  # Real and Synthetic side by side
+print(missing_summary)
+```
+
+```{r visits plot}
+p_visits <- both %>%
+  count(source, patient_id) %>%                          # visits per patient
+  ggplot(aes(x = n, fill = source)) +
+  geom_histogram(binwidth = 1, position = "dodge") +
+  xlab("Visits per patient") +
+  ylab("Patients") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+p_visits
+```
+
+
+## 4. Patient traits
+
+Traits are made by synthpop in the generator, so a synthetic patient should not be a copy of a real one.
+
+```{r traits}
+# one row per patient
+real_traits <- pbc_real %>% distinct(patient_id, trt, sex, age)
+syn_traits  <- pbc_syn  %>% distinct(patient_id, trt, sex, age)
+both_traits <- bind_rows(Real = real_traits, Synthetic = syn_traits, .id = "source")
+```
+
+```{r trait mix}
+# % of patients in each trt x sex group
+trait_mix <- both_traits %>%
+  count(source, trt, sex) %>%
+  group_by(source) %>%
+  mutate(pct = round(100 * n / sum(n), 1)) %>%
+  ungroup() %>%
+  select(-n) %>%
+  pivot_wider(names_from = source, values_from = pct)
+print(trait_mix)
+
+# age distribution
+age_summary <- both_traits %>%
+  group_by(source) %>%
+  summarise(mean = mean(age),
+            sd = sd(age),
+            min = min(age),
+            median = median(age),
+            max = max(age),
+            .groups = "drop")
+print(age_summary)
+```
+
+```{r trait copies}
+# ---- Exact copies of a real patient's traits ----
+exact_match <- mean(paste(syn_traits$trt, syn_traits$sex, syn_traits$age) %in%
+                    paste(real_traits$trt, real_traits$sex, real_traits$age))
+
+# ---- Age gap to the nearest real patient with the same trt and sex ----
+nearest_age <- map_dbl(seq_len(nrow(syn_traits)), function(i) {
+  same <- real_traits %>%
+    filter(trt == syn_traits$trt[i], sex == syn_traits$sex[i])   # real patients in the same group
+  min(abs(same$age - syn_traits$age[i]))                        # closest age
+})
+
+cat("Synthetic patients with the exact traits of a real patient:", round(100 * exact_match, 1), "%\n")
+cat("Age gap to the nearest real patient of the same trt and sex (years): median",
+    round(median(nearest_age), 2), "; min", round(min(nearest_age), 3), "\n")
+```
+
+
+## 5. Distributions
+
+```{r lab summary}
+# summary of each lab, real vs synthetic
+lab_summary <- both %>%
+  pivot_longer(all_of(labs), names_to = "variable") %>%   # long: one row per visit and lab
+  filter(!is.na(value)) %>%
+  group_by(variable, source) %>%
+  summarise(mean = mean(value),
+            sd = sd(value),
+            q25 = quantile(value, 0.25),
+            median = median(value),
+            q75 = quantile(value, 0.75),
+            min = min(value),
+            max = max(value),
+            .groups = "drop")
+print(as.data.frame(lab_summary), digits = 3)
+```
+
+```{r lab densities}
+p_dens <- both %>%
+  pivot_longer(all_of(labs), names_to = "variable") %>%
+  filter(!is.na(value)) %>%
+  ggplot(aes(x = value, colour = source)) +
+  geom_density(linewidth = 0.8) +
+  scale_x_log10() +                                 # labs are skewed: log scale for the plot only
+  facet_wrap(~ variable, scales = "free") +
+  xlab("Value (log scale)") +
+  ylab("Density") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+p_dens
+```
+
+```{r ecdf plots, fig.width = 10}
+# NEW: ECDF of one lab, real vs synthetic
+plot_ecdf <- function(var) {
+  both %>%
+    filter(!is.na(.data[[var]])) %>%
+    ggplot(aes(x = .data[[var]], colour = source)) +
+    stat_ecdf(linewidth = 0.8) +
+    scale_x_log10() +                                 # skewed: log scale for the plot only
+    labs(title = var, x = paste(var, "(log scale)"), y = "Cumulative proportion") +
+    theme_minimal() +
+    theme(legend.position = "bottom")
+}
+
+p_ecdf_bili <- plot_ecdf("bili")
+p_ecdf_alk  <- plot_ecdf("alk.phos")
+p_ecdf_bili + p_ecdf_alk
+```
+
+```{r category summary}
+# % of visits at each level of each categorical variable
+cat_summary <- both %>%
+  pivot_longer(all_of(cats), names_to = "variable", values_to = "level") %>%
+  filter(!is.na(level)) %>%
+  count(variable, source, level) %>%
+  group_by(variable, source) %>%
+  mutate(pct = round(100 * n / sum(n), 1)) %>%
+  ungroup() %>%
+  select(-n) %>%
+  pivot_wider(names_from = source, values_from = pct)
+print(cat_summary)
+```
+
+
+## 6. Correlations
+
+```{r correlations}
+# Spearman correlations between labs
+cor_real <- cor(pbc_real[labs], method = "spearman", use = "pairwise.complete.obs")
+cor_syn  <- cor(pbc_syn[labs],  method = "spearman", use = "pairwise.complete.obs")
+cor_diff <- cor_syn - cor_real
+
+cat("Largest correlation difference (synthetic - real):", round(max(abs(cor_diff)), 2), "\n")
+```
+
+```{r correlation plot, fig.width = 15, fig.height = 4.5}
+# heatmap of one correlation matrix
+cor_plot <- function(m, title) {
+  as.data.frame(as.table(m)) %>%                              # matrix -> long table (Var1, Var2, Freq)
+    ggplot(aes(Var1, Var2, fill = Freq)) +
+    geom_tile() +
+    geom_text(aes(label = round(Freq, 2)), size = 3) +
+    scale_fill_gradient2(low = "blue", mid = "white", high = "red", limits = c(-1, 1)) +
+    labs(title = title, x = NULL, y = NULL, fill = "Spearman") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+}
+
+cor_plot(cor_real, "Real") + cor_plot(cor_syn, "Synthetic") + cor_plot(cor_diff, "Synthetic - Real")
+```
+
+
+## 7. Trajectories
+
+```{r trajectories}
+# Median and IQR of each lab at each half-year (time points with at least 10 patients)
+p_traj <- both %>%
+  pivot_longer(all_of(labs), names_to = "variable") %>%
+  filter(!is.na(value)) %>%
+  group_by(source, variable, t) %>%
+  summarise(n = n(),
+            median = median(value),
+            q25 = quantile(value, 0.25),
+            q75 = quantile(value, 0.75),
+            .groups = "drop") %>%
+  filter(n >= 10) %>%                                              # drop sparse late time points
+  ggplot(aes(x = t, y = median, colour = source, fill = source)) +
+  geom_ribbon(aes(ymin = q25, ymax = q75), alpha = 0.15, colour = NA) +
+  geom_line(linewidth = 0.8) +
+  facet_wrap(~ variable, scales = "free_y") +
+  xlab("Half-years since entry") +
+  ylab("Median (IQR)") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+p_traj
+```
+
+```{r spaghetti}
+# Bilirubin for 12 random patients from each source
+set.seed(1)
+spaghetti_ids <- both %>%
+  distinct(source, patient_id) %>%
+  group_by(source) %>%
+  filter(patient_id %in% sample(unique(patient_id), 12)) %>%   # 12 patients per source
+  ungroup()
+
+p_spag <- both %>%
+  semi_join(spaghetti_ids, by = c("source", "patient_id")) %>%
+  ggplot(aes(x = t, y = bili, group = patient_id)) +
+  geom_line(alpha = 0.6) +
+  geom_point(size = 1) +
+  scale_y_log10() +
+  facet_wrap(~ source) +
+  xlab("Half-years since entry") +
+  ylab("Bilirubin (log scale)") +
+  theme_minimal()
+p_spag
+```
+
+
+## 8. Within-patient structure
+
+For each lab: `lme(log(lab) ~ t, random = ~ t | patient_id)` on real and synthetic data.
+sd_intercept / sd_slope = how much patients differ in level / in change over time; sd_resid = visit-to-visit noise;
+lag1_cor = correlation of a patient's residuals at consecutive visits.
+
+```{r variance components}
+# var components for one lab
+var_components <- function(db, var) {
+  d <- db %>%
+    mutate(y = log(.data[[var]])) %>%   # take log
+    filter(!is.na(y)) %>%
+    arrange(patient_id, t)
+
+  # random intercept + slope model
+  f <- tryCatch(lme(y ~ t, random = ~ t | patient_id, data = d, method = "ML",
+                    control = lmeControl(opt = "optim")),
+                error = function(e) NULL)
+  if (is.null(f)) return(tibble(variable = var))
+
+  sds <- as.numeric(VarCorr(f)[, "StdDev"])   # sd as numeric: intercept, slope, residual
+
+  # residual and the same patient's residual at the previous visit
+  r <- d %>%
+    mutate(e = resid(f)) %>%
+    group_by(patient_id) %>%
+    mutate(e_prev = lag(e)) %>%
+    ungroup()
+
+  tibble(variable = var,
+         sd_intercept = sds[1],
+         sd_slope = sds[2],
+         sd_resid = sds[3],
+         lag1_cor = cor(r$e, r$e_prev, use = "complete.obs"))
+}
+
+# all labs, real and synthetic
+vc_table <- map_dfr(labs, function(v) {
+  bind_rows(Real = var_components(pbc_real, v),
+            Synthetic = var_components(pbc_syn, v),
+            .id = "source")
+})
+print(as.data.frame(vc_table), digits = 3)
+```
+
+```{r category switches}
+# switches for one categorical variable: times a patient's value changes between consecutive visits
+switches <- function(db, var) {
+  db %>%
+    arrange(patient_id, t) %>%
+    filter(!is.na(.data[[var]])) %>%
+    group_by(patient_id) %>%
+    summarise(n_switch = sum(.data[[var]] != lag(.data[[var]]), na.rm = TRUE),
+              .groups = "drop")
+}
+
+# all categorical variables, real and synthetic
+switch_table <- map_dfr(cats, function(v) {
+  bind_rows(Real = switches(pbc_real, v),
+            Synthetic = switches(pbc_syn, v),
+            .id = "source") %>%
+    group_by(source) %>%
+    summarise(variable = v,
+              mean_switches = mean(n_switch),
+              pct_never_switch = round(100 * mean(n_switch == 0), 1),
+              max_switches = max(n_switch),
+              .groups = "drop")
+})
+print(switch_table)
+```
+
+
+## 9. Model transfer
+
+The question that matters: would an analyst reach the same conclusions from the synthetic data?
+Model: `log(bili) ~ trt * time + age + sex`, random intercept and slope per patient, time as linear (0 knots)
+or natural spline (1-4 knots), knots chosen by BIC (same approach as PART 4 of the JJ project).
+
+```{r bili model}
+knots_seq <- 0:4
+
+# bilirubin model with k knots (k = 0 -> linear time)
+# CHANGED: lab argument added (default bili) so the same model is reused for alk.phos in 9b
+bili_model <- function(db, k, lab = "bili") {
+  time_term <- if (k == 0) "t" else paste0("ns(t, df = ", k + 1, ")")
+  fm <- as.formula(paste0("log(", lab, ") ~ trt * ", time_term, " + age + sex"))
+  tryCatch(lme(fm, random = ~ t | patient_id, data = db, na.action = na.omit, method = "ML",
+               control = lmeControl(opt = "optim")),
+           error = function(e) NULL)   # failed fit -> NULL
+}
+```
+
+```{r knots by BIC}
+# BIC for each knot count, real and synthetic
+bic_table <- map_dfr(knots_seq, function(k) {
+  f_r <- bili_model(pbc_real, k)
+  f_s <- bili_model(pbc_syn, k)
+  tibble(knots = k,
+         BIC_real = if (is.null(f_r)) NA else BIC(f_r),
+         BIC_syn  = if (is.null(f_s)) NA else BIC(f_s))
+}) %>%
+  mutate(Delta_BIC_real = BIC_real - min(BIC_real, na.rm = TRUE),
+         Delta_BIC_syn  = BIC_syn  - min(BIC_syn,  na.rm = TRUE))
+print(bic_table)
+
+best_knots_real <- bic_table$knots[which.min(bic_table$BIC_real)]
+best_knots_syn  <- bic_table$knots[which.min(bic_table$BIC_syn)]
+cat("Best knots (BIC): real =", best_knots_real, "; synthetic =", best_knots_syn, "\n")
+```
+
+```{r coefficients}
+# same model (real's knots) on both
+f_real <- bili_model(pbc_real, best_knots_real)
+f_syn  <- bili_model(pbc_syn,  best_knots_real)
+
+# estimate, 95% CI and p-value of each coefficient
+coef_table <- function(f) {
+  s <- summary(f)$tTable
+  tibble(term = rownames(s),
+         est = s[, "Value"],
+         lo  = s[, "Value"] - 1.96 * s[, "Std.Error"],
+         hi  = s[, "Value"] + 1.96 * s[, "Std.Error"],
+         p   = s[, "p-value"])
+}
+
+# share of each CI covered by the other, averaged (1 = identical CIs)
+ci_overlap <- function(l1, u1, l2, u2) {
+  ov <- pmax(0, pmin(u1, u2) - pmax(l1, l2))
+  (ov / (u1 - l1) + ov / (u2 - l2)) / 2
+}
+
+coef_compare <- inner_join(coef_table(f_real), coef_table(f_syn),
+                           by = "term", suffix = c("_real", "_syn")) %>%
+  mutate(same_sign = sign(est_real) == sign(est_syn),
+         same_decision = (p_real < 0.05) == (p_syn < 0.05),   # significant in both or neither
+         ci_overlap = ci_overlap(lo_real, hi_real, lo_syn, hi_syn))
+print(as.data.frame(coef_compare), digits = 3)
+```
+
+```{r marginal means plot, fig.width = 10}
+# marginal means by treatment over time, one panel
+plot_means <- function(f, db, title, ylab = "log bilirubin (marginal mean)") {   # CHANGED: ylab argument
+  as.data.frame(emmeans(f, ~ t | trt, at = list(t = seq(0, 20, 2)), data = db)) %>%
+    ggplot(aes(x = t, y = emmean, colour = trt)) +
+    geom_line(linewidth = 0.8) +
+    geom_errorbar(aes(ymin = lower.CL, ymax = upper.CL), width = 0.3) +
+    scale_colour_manual(values = c("red", "blue"), name = "Treatment (trt)") +
+    labs(title = title, x = "Half-years since entry", y = ylab) +
+    theme_minimal() +
+    theme(legend.position = "bottom")
+}
+
+p_means <- plot_means(f_real, pbc_real, "Real") + plot_means(f_syn, pbc_syn, "Synthetic")
+p_means
+```
+
+
+## 9b. Model transfer: alkaline phosphatase   <!-- NEW -->
+
+Same model and knot selection as bilirubin, with `log(alk.phos)` as the outcome.
+
+```{r alk.phos knots by BIC}
+# BIC for each knot count, real and synthetic
+bic_table_alk <- map_dfr(knots_seq, function(k) {
+  f_r <- bili_model(pbc_real, k, lab = "alk.phos")
+  f_s <- bili_model(pbc_syn, k, lab = "alk.phos")
+  tibble(knots = k,
+         BIC_real = if (is.null(f_r)) NA else BIC(f_r),
+         BIC_syn  = if (is.null(f_s)) NA else BIC(f_s))
+}) %>%
+  mutate(Delta_BIC_real = BIC_real - min(BIC_real, na.rm = TRUE),
+         Delta_BIC_syn  = BIC_syn  - min(BIC_syn,  na.rm = TRUE))
+print(bic_table_alk)
+
+best_knots_alk_real <- bic_table_alk$knots[which.min(bic_table_alk$BIC_real)]
+best_knots_alk_syn  <- bic_table_alk$knots[which.min(bic_table_alk$BIC_syn)]
+cat("Best knots (BIC): real =", best_knots_alk_real, "; synthetic =", best_knots_alk_syn, "\n")
+```
+
+```{r alk.phos coefficients}
+# same model (real's knots) on both
+f_alk_real <- bili_model(pbc_real, best_knots_alk_real, lab = "alk.phos")
+f_alk_syn  <- bili_model(pbc_syn,  best_knots_alk_real, lab = "alk.phos")
+
+coef_compare_alk <- inner_join(coef_table(f_alk_real), coef_table(f_alk_syn),
+                               by = "term", suffix = c("_real", "_syn")) %>%
+  mutate(same_sign = sign(est_real) == sign(est_syn),
+         same_decision = (p_real < 0.05) == (p_syn < 0.05),   # significant in both or neither
+         ci_overlap = ci_overlap(lo_real, hi_real, lo_syn, hi_syn))
+print(as.data.frame(coef_compare_alk), digits = 3)
+```
+
+```{r alk.phos marginal means plot, fig.width = 10}
+p_means_alk <- plot_means(f_alk_real, pbc_real, "Real", ylab = "log alk.phos (marginal mean)") +
+  plot_means(f_alk_syn, pbc_syn, "Synthetic", ylab = "log alk.phos (marginal mean)")
+p_means_alk
+```
+
+
+## 10. Overall utility and privacy
+
+S_pMSE: a CART model tries to tell real rows from synthetic rows (synthpop). 1 = as good as chance; under 10 is usually
+called good.
+Distance to closest record (DCR): for each synthetic visit, the distance to the nearest real visit (labs on log
+scale, standardized). Compare with real visits' distance to their nearest *other* real visit: if synthetic visits are
+much closer than that, the generator is copying.
+
+```{r S_pMSE}
+utility_vars <- c("t", traits, labs, cats)
+
+# synthpop uses "t" internally, so rename it
+prep <- function(db) {
+  as.data.frame(db[utility_vars]) %>%
+    rename(time_bin = t)
+}
+
+ug <- utility.gen(prep(pbc_syn), prep(pbc_real), method = "cart", print.flag = FALSE)
+cat("S_pMSE:", round(ug$S_pMSE, 2), "\n")
+```
+
+```{r distance to closest record}
+# visits with no missing values: time, age, log labs
+dcr_matrix <- function(db) {
+  db %>%
+    select(t, age, all_of(labs)) %>%
+    na.omit() %>%
+    mutate(across(all_of(labs), log)) %>%
+    as.matrix()
+}
+real_m <- dcr_matrix(pbc_real)
+syn_m  <- dcr_matrix(pbc_syn)
+
+# standardize both with the real means and SDs
+centre <- colMeans(real_m)
+scl    <- apply(real_m, 2, sd)
+real_m <- scale(real_m, centre, scl)
+syn_m  <- scale(syn_m, centre, scl)
+
+# distance from each row of 'from' to its nearest row of 'to'
+nearest_dist <- function(from, to, same = FALSE) {
+  map_dbl(seq_len(nrow(from)), function(i) {
+    d <- sqrt(colSums((t(to) - from[i, ])^2))   # distance to every row of 'to'
+    if (same) d[i] <- Inf                        # real vs real: skip itself
+    min(d)
+  })
+}
+
+dcr <- bind_rows(tibble(type = "Synthetic to nearest real",  dist = nearest_dist(syn_m, real_m)),
+                 tibble(type = "Real to nearest other real", dist = nearest_dist(real_m, real_m, same = TRUE)))
+
+dcr_summary <- dcr %>%
+  group_by(type) %>%
+  summarise(n = n(),
+            pct_exact_copy = round(100 * mean(dist < 1e-8), 2),   # distance 0 = copied visit
+            q05 = quantile(dist, 0.05),
+            median = median(dist),
+            .groups = "drop")
+print(dcr_summary)
+```
+
+```{r dcr plot}
+p_dcr <- ggplot(dcr, aes(x = dist, colour = type)) +
+  geom_density(linewidth = 0.8) +
+  xlab("Distance to closest record (standardized)") +
+  ylab("Density") +
+  theme_minimal() +
+  theme(legend.position = "bottom", legend.title = element_blank())
+p_dcr
+```
+
+
+## 11. Summary
+
+```{r summary}
+summary_table <- tribble(
+  ~check, ~result, ~good_if,
+  "Visits per patient (median), real / synthetic",
+    paste(visit_summary$visits_per_patient_median, collapse = " / "), "similar",
+  "Largest missing-% difference",
+    paste0(round(max(abs(missing_summary$Real - missing_summary$Synthetic)), 1), " points"), "< 5 points",
+  "Synthetic patients with exact real traits",
+    paste0(round(100 * exact_match, 1), "%"), "0%",
+  "Largest Spearman correlation difference",
+    as.character(round(max(abs(cor_diff)), 2)), "< 0.10",
+  "Best knots, real / synthetic",
+    paste(best_knots_real, best_knots_syn, sep = " / "), "same",
+  "Coefficients with the same sign",
+    paste0(round(100 * mean(coef_compare$same_sign)), "%"), "high",
+  "Coefficients with the same significance call",
+    paste0(round(100 * mean(coef_compare$same_decision)), "%"), "high",
+  "Mean CI overlap",
+    as.character(round(mean(coef_compare$ci_overlap), 2)), "near 1 (bootstrap of real data ~0.8)",
+  "S_pMSE",
+    as.character(round(ug$S_pMSE, 2)), "< 10",
+  "Synthetic visits that copy a real visit exactly",
+    paste0(dcr_summary$pct_exact_copy[dcr_summary$type == "Synthetic to nearest real"], "%"), "0%"
+)
+knitr::kable(summary_table)
+
+write_csv(summary_table, file.path(results.dir, "PART_3_PBC_summary.csv"))
+```

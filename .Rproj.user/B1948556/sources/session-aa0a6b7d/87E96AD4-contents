@@ -1,0 +1,763 @@
+---
+title: "PART 1 — Synthetic Data Generator (Sequential VAE)"
+author: "Piers Seidman (based on Mayte Suárez-Fariñas' original)"
+output: html_document
+---
+
+**SEQUENTIAL VAE VERSION** (copy of PART_1_Synthetic_Data_Generator.Rmd; the original is unchanged).
+Changes from the temporal VAE are marked `# SEQ`: besides the patient-level latent z (one per patient), the model has a
+**day-level latent z_t** with a learned AR(1) prior, so day-to-day memory and the links between variables on the same
+day (e.g. steroid and HR) are learned inside the model. The structured noise added after the model (fix 3) is
+therefore off by default (`structured_noise = FALSE`).
+
+**v2 (fully generative, marked `# SEQ v2`):** every random part comes from the model itself, nothing is added afterwards.
+The decoder also outputs a **variance** for each continuous value (trained with the Gaussian likelihood instead of
+squared error) and values are drawn from N(mean, variance); the day-level latent z_t is drawn from the model's own
+**learned AR(1) prior** (with its own KL weight `kl_beta_dyn`, default 1, so the prior matches what the encoder learned);
+categories (e.g. steroid) are drawn from the decoder's daily probabilities (fix 4 off), so they share z_t with the values.
+
+Generates synthetic longitudinal data with a conditional temporal VAE (LSTM encoder/decoder).
+This file only defines the generator; the data are generated in the files that use it
+(PART 2 — Corsano data, PART 3 — PBC and the other test datasets). **CHANGED:** the Corsano generation moved to PART 2.
+
+Input: a data frame with `patient_id`, a time column (`time_var`) and variable columns; nothing else to choose.
+What the generator handles: unequal and irregular visits (visit grid from `time_var`), missing values
+(masked in the loss, missingness reproduced), patient traits found automatically (variables constant within
+patient) used as conditioning, Box-Cox + standardization, KL warm-up, z drawn given the traits,
+noise with the real structure (patient-level intercept/slope + day-to-day correlation), persistent draws for
+time-varying categories, and output on the observed scale (no NaN, observed bounds, discrete values kept).
+Changes from the original code are marked `# NEW` / `# CHANGED`. Fixes 1–4 refer to the validation in PART 3.
+
+```{r setup, message=FALSE, warning=FALSE}
+library(reticulate)
+py_require(python_version = "3.12")    # TensorFlow has no Python 3.13 build; must run before library(keras3)
+library(keras3)
+library(tidyverse)
+library(car)        # Box-Cox (powerTransform)
+library(lme4)       # noise structure (fix 3)
+library(synthpop)   # synthetic patient traits (privacy)   # NEW
+# CHANGED: data_file / out_dir removed (Corsano data are now generated in PART 2)
+```
+
+## Generator: main function
+
+```{r generator-main}
+generate_synthetic_temporal_vae <- function(
+  real_data,
+  n_patients = NULL,
+  n_timepoints = NULL,
+  var_types = NULL,
+  latent_dim = 8,
+  epochs = 1000,       # CHANGED: was 50; now a maximum, early stopping decides
+  batch_size = 32,
+  seed = 42,
+  verbose = 1,
+  time_var = "time",   # NEW: name of the time column (its values define the visit grid)
+  kl_beta = 0.05,      # NEW: final KL weight (< 1 keeps more patient information in z)
+  kl_warmup = 100,     # NEW: epochs over which the KL weight rises from 0 to kl_beta
+  patience = 100,      # NEW: early stopping patience (epochs)
+  dyn_dim = 4,         # SEQ: size of the day-level latent z_t
+  kl_beta_dyn = 1,     # SEQ v2: KL weight for z_t (1: z_t follows its AR(1) prior, so it can be sampled from it)
+  structured_noise = FALSE,  # SEQ: add the fix 3 noise after the model (off: z_t models day-to-day variation)
+  m = 1                      # NEW (pooling): number of synthetic datasets drawn from the one trained model
+) {
+
+  #' Generate synthetic longitudinal data via Temporal VAE
+  #'
+  #' @param real_data Dataframe with patient_id, the time column, and variable columns
+  #' @param n_patients Number of patients to generate (default: number in real_data)
+  #' @param n_timepoints Must equal the number of distinct time values in real_data
+  #' @param var_types Named list of variable types (auto-detected if NULL)
+  #' @param latent_dim Dimensionality of latent space (default: 8)
+  #' @param epochs Maximum number of training epochs (default: 1000)
+  #' @param batch_size Batch size for training (default: 32)
+  #' @param seed Random seed
+  #' @param verbose Keras verbosity (0=silent, 1=progress, 2=one line per epoch)
+  #' @param time_var Name of the time column. Its distinct values form the visit grid; patients may have any
+  #'        subset of them (unequal / irregular visits). Output uses the same column name.
+  #' @param kl_beta,kl_warmup,patience Training settings (see Background in PART 1)
+  #' @param m Number of synthetic datasets (default 1). The model is trained once; traits, z, z_t and draws are new
+  #'        for each dataset. m > 1 returns a list of m data frames (for pooling, as synthpop's summary.fit.synds)
+  #'
+  #' Variables constant within every patient (and never missing) are patient traits: they are given to the
+  #' encoder and decoder as conditioning, and each synthetic patient's z is drawn given its traits.
+  #' Missing values are allowed: they are left out of the loss, and where values and visits are missing is
+  #' learned and reproduced.
+  #'
+  #' @return Dataframe with synthetic data (original scale), or a list of m of them; training history in attr(, "history")
+
+  set.seed(seed)
+  set_random_seed(seed)  # CHANGED: keras3 replacement for use_session_with_seed()
+
+  # Step 1: Order rows and build the visit grid                  # NEW (unequal / irregular visits)
+  real_data <- real_data %>%
+    rename(.time = all_of(time_var)) %>%
+    arrange(patient_id, .time)
+  if (anyNA(real_data$.time)) stop("The time column has missing values.")
+  if (anyDuplicated(real_data[c("patient_id", ".time")])) stop("A patient has two rows with the same time.")
+  time_grid <- sort(unique(real_data$.time))
+  patient_ids       <- unique(real_data$patient_id)
+  n_patients_real   <- length(patient_ids)
+  n_timepoints_real <- length(time_grid)
+  cat(sprintf("Visit grid: %d time points; %d patients; %.0f%% of patient-time slots observed\n",
+              n_timepoints_real, n_patients_real, 100 * nrow(real_data) / (n_patients_real * n_timepoints_real)))
+
+  # Infer defaults
+  if (is.null(n_patients)) {
+    n_patients <- n_patients_real
+  }
+  if (is.null(n_timepoints)) {
+    n_timepoints <- n_timepoints_real                            # CHANGED: grid length (was max(time))
+  }
+  if (n_timepoints != n_timepoints_real) stop("n_timepoints must equal the number of distinct time values.")  # NEW
+
+  # Step 1b: De-identify
+  data_vars <- real_data %>% select(-patient_id, -.time)          # CHANGED: time also removed (grid position encodes it)
+
+  # Step 2: Auto-detect variable types
+  if (is.null(var_types)) {
+    var_types <- auto_detect_var_types(data_vars)
+    cat("Auto-detected variable types:\n")
+    iwalk(var_types, ~ cat(sprintf("  %s: %s\n", .y, .x)))
+  }
+  vars <- names(var_types)[var_types %in% c("continuous", "categorical")]   # NEW: drop type "other"
+  if (length(setdiff(names(data_vars), vars)) > 0) {
+    message("DATA CHANGE: dropped variables of type 'other': ", paste(setdiff(names(data_vars), vars), collapse = ", "))
+  }
+  var_types <- var_types[vars]
+  data_vars <- data_vars %>% select(all_of(vars))
+
+  # Step 2b: Patient traits = variables constant within every patient and never missing   # NEW (conditioning)
+  static_vars <- detect_static_vars(real_data, vars)
+  cond_vars <- static_vars[!map_lgl(static_vars, ~ anyNA(data_vars[[.x]]))]
+  seq_types <- var_types[setdiff(vars, cond_vars)]
+  has_cond  <- length(cond_vars) > 0
+  cat("Patient traits (conditioning):", if (has_cond) paste(cond_vars, collapse = ", ") else "none", "\n")
+
+  # Step 3: Fit Box-Cox transformations
+  boxcox_params <- fit_boxcox_parallel_r(data_vars, var_types)
+  cat("✓ Box-Cox transformations fitted\n")
+
+  # Step 4: Apply Box-Cox
+  data_boxcox <- apply_boxcox_parallel_r(data_vars, boxcox_params, var_types)
+
+  # Step 5: Fit marginals and standardize
+  marginals <- fit_marginals_r(data_boxcox, var_types)
+  data_standardized <- standardize_data_r(data_boxcox, marginals, var_types)
+  value_maps <- build_value_maps(data_vars, data_standardized, var_types)   # NEW (fix 1, 2): way back to observed values
+
+  # Step 6: Put every patient on the full grid (empty slot = no visit), encode, add masks, reshape   # CHANGED
+  data_grid <- tibble(patient_id = rep(patient_ids, each = n_timepoints_real),
+                      .time = rep(time_grid, n_patients_real)) %>%
+    left_join(bind_cols(real_data %>% select(patient_id, .time), data_standardized, .visit = 1),
+              by = c("patient_id", ".time")) %>%
+    mutate(.visit = coalesce(.visit, 0))
+  encoded <- encode_features(data_grid %>% select(all_of(names(seq_types))), marginals, seq_types)  # NEW: one-hot
+  # Masks (NEW): the network cannot take NA, so missing values enter as 0. A 0 alone is ambiguous
+  # (real value or gap?), so every value gets a 0/1 flag:
+  #   observed mask (one per variable): 1 = value measured, 0 = missing (e.g. skin temp missing on 41% of JJ days)
+  #   visit mask (.visit, one per time point): 1 = the patient had any data at that time point
+  # Training: the loss only counts values whose observed mask is 1, so the placeholder 0s are never learned.
+  # Generating: the model also predicts both masks; drawn 0s become NA (observed) or dropped rows (visit),
+  # which reproduces the real gaps and wear patterns.
+  obs_mask <- map(set_names(names(seq_types)),                      # NEW: 1 = value observed at a visit
+                  ~ as.numeric(!is.na(data_grid[[.x]]) & data_grid$.visit == 1)) %>% as_tibble() %>% as.matrix()
+  colnames(obs_mask) <- paste0(colnames(obs_mask), "__observed")
+  seq_matrix <- cbind(encoded$matrix, obs_mask, .visit = data_grid$.visit)   # NEW: values | observed | visit
+  seq_matrix[is.na(seq_matrix)] <- 0                                # NEW: missing values enter as 0 (masked in loss)
+
+  X_train <- reshape_to_sequences(seq_matrix, n_patients_real, n_timepoints_real)
+  cat(sprintf("✓ Data reshaped to sequences: (%d, %d, %d)\n",
+              dim(X_train)[1], dim(X_train)[2], dim(X_train)[3]))
+
+  if (has_cond) {                                                   # NEW: traits, one row per patient
+    patient_cond <- data_standardized[match(patient_ids, real_data$patient_id), cond_vars]
+    C_train <- encode_features(patient_cond, marginals, var_types[cond_vars])$matrix
+  }
+  model_x <- if (has_cond) list(X_train, C_train) else X_train    # NEW
+
+  # Step 7: Build and train Temporal VAE
+  vae_model <- build_temporal_vae(
+    n_timepoints_real,
+    encoded,                                                        # CHANGED: encoding info (was n_features)
+    latent_dim,
+    n_cond = if (has_cond) ncol(C_train) else 0,                    # NEW
+    seq_vars = names(seq_types),                                    # NEW
+    dyn_dim = dyn_dim                                               # SEQ
+  )
+
+  cat("✓ Temporal VAE model built\n")
+
+  history <- vae_model %>% fit(
+    model_x, X_train,                                               # CHANGED: was X_train, X_train
+    epochs = epochs,
+    batch_size = batch_size,
+    validation_split = 0.1,
+    verbose = verbose,
+    callbacks = list(                                               # NEW
+      callback_kl_warmup(kl_warmup, kl_beta, kl_beta_dyn),          # KL warm-up (avoids posterior collapse)   # SEQ v2: + kl_beta_dyn
+      callback_early_stopping(monitor = "val_loss", patience = patience, restore_best_weights = TRUE,
+                              start_from_epoch = kl_warmup)
+    )
+  )
+
+  cat(sprintf("✓ Temporal VAE trained (%d epochs run)\n", length(history$metrics$loss)))
+
+  # Step 7b: Structure of what the model misses (per variable): patient-level intercept/slope,   # NEW (fix 3)
+  # day-to-day correlation (AR(1)) and residual SD, from the reconstruction errors of the real patients
+  noise <- if (structured_noise) {                                  # SEQ: optional (off by default)
+    estimate_noise_structure(vae_model, model_x, X_train, encoded, colnames(seq_matrix),
+                             static_vars, n_timepoints_real)
+  } else NULL
+  cat_persistence <- NULL   # SEQ v2: fix 4 off; categories drawn from the decoder's daily probabilities (persistence from z_t)
+
+  # Step 8: Draw z for each synthetic patient                       # CHANGED (was z ~ N(0, I) per time point)
+  decoder <- get_layer(vae_model, "decoder")
+  z_model <- keras_model(vae_model$inputs, list(get_layer(vae_model, "z_mean")$output,
+                                                get_layer(vae_model, "z_log_var")$output))
+  z_real   <- z_model %>% predict(model_x, verbose = 0)
+  post_var <- diag(colMeans(exp(z_real[[2]])), latent_dim)
+  draw_one <- function(i) {                                        # NEW (pooling): one synthetic dataset; called m times
+    if (has_cond) {                                                   # CHANGED (privacy): synthetic traits; z given traits
+      synthetic_cond <- synthesize_traits(data_vars[match(patient_ids, real_data$patient_id), cond_vars, drop = FALSE],
+                                          var_types[cond_vars], n_patients, seed + i - 1) %>%   # NEW: was real patients' traits resampled; POOL: seed + i - 1 (new traits per dataset)
+        apply_boxcox_parallel_r(boxcox_params, var_types[cond_vars]) %>%
+        standardize_data_r(marginals, var_types[cond_vars])
+      C_new  <- encode_features(synthetic_cond, marginals, var_types[cond_vars])$matrix
+      X_real <- cbind(1, C_train)
+      z_coef <- MASS::ginv(X_real) %*% z_real[[1]]                   # least squares (ginv: one-hot columns collinear)
+      z_samples <- cbind(1, C_new) %*% z_coef +
+        matrix(MASS::mvrnorm(n_patients, rep(0, latent_dim), cov(z_real[[1]] - X_real %*% z_coef) + post_var),
+               ncol = latent_dim)
+    } else {                                                          # z from where real patients' z lie
+      z_samples <- matrix(MASS::mvrnorm(n_patients, colMeans(z_real[[1]]), cov(z_real[[1]]) + post_var),
+                          ncol = latent_dim)
+    }
+
+    # Step 9: Generate synthetic data
+    # SEQ v2: day-level latent paths drawn from the model's own learned AR(1) prior
+    rho_dyn <- 0.99 * plogis(as.numeric(get_layer(vae_model, "zd_sampling")$rho_logit$numpy()))
+    zd_samples <- draw_dynamic_prior(rho_dyn, n_patients, n_timepoints)
+
+    decoded <- decoder %>% predict(if (has_cond) list(z_samples, zd_samples, C_new) else list(z_samples, zd_samples),
+                                   verbose = 0)                       # SEQ: + zd_samples
+    decoded_matrix <- sequences_to_matrix(decoded)
+    cont_v <- encoded$continuous_vars
+    colnames(decoded_matrix) <- c(colnames(seq_matrix), paste0(cont_v, "__logvar"))   # SEQ v2: + learned log-variances
+
+    # SEQ v2: continuous values drawn from the decoder's own N(mean, variance), not just its mean
+    decoded_matrix[, cont_v] <- decoded_matrix[, cont_v, drop = FALSE] +
+      exp(0.5 * pmin(pmax(decoded_matrix[, paste0(cont_v, "__logvar"), drop = FALSE], -6), 4)) *
+      matrix(rnorm(nrow(decoded_matrix) * length(cont_v)), ncol = length(cont_v))
+
+    # Step 9b: Draw which visits exist and which values are missing  # NEW
+    pid <- rep(seq_len(n_patients), each = n_timepoints)
+    visit_draw <- if (all(data_grid$.visit == 1)) rep(1, nrow(decoded_matrix)) else rbinom(nrow(decoded_matrix), 1, decoded_matrix[, ".visit"])
+    no_visit <- setdiff(seq_len(n_patients), unique(pid[visit_draw == 1]))
+    visit_draw[map_int(no_visit, ~ which(pid == .x)[which.max(decoded_matrix[pid == .x, ".visit"])])] <- 1  # at least one visit
+    observed_draw <- map(set_names(names(seq_types)), function(var) {
+      p_obs <- decoded_matrix[, paste0(var, "__observed")]
+      if (all(obs_mask[data_grid$.visit == 1, paste0(var, "__observed")] == 1)) return(rep(1, length(p_obs)))
+      if (var %in% static_vars) rbinom(n_patients, 1, tapply(p_obs, pid, mean))[pid] else rbinom(length(p_obs), 1, p_obs)
+    })
+
+    synthetic_data <- decode_features(decoded_matrix[, colnames(encoded$matrix), drop = FALSE], encoded, marginals,
+                                      static_vars, n_timepoints, noise, cat_persistence) %>%   # NEW: structured noise
+      mutate(across(all_of(names(seq_types)), ~ replace(.x, observed_draw[[cur_column()]] == 0, NA)))   # NEW: missingness
+    if (has_cond) {
+      synthetic_data <- bind_cols(synthetic_data, synthetic_cond[pid, ])                   # NEW: traits back
+    }
+
+    # Step 10: Back to the original scale                            # CHANGED (fix 1, 2): was inverse standardize
+    synthetic_data <- map_to_observed_r(synthetic_data, value_maps)  # + inverse Box-Cox (gave NaN, ignored bounds)
+
+    # Step 11: Add fake IDs and time structure
+    synthetic_data <- synthetic_data %>%
+      mutate(
+        patient_id = rep(sample(10000:99999, n_patients, replace = FALSE), each = n_timepoints),
+        .time = rep(time_grid, n_patients)                         # CHANGED: real grid values (was 1:n_timepoints)
+      ) %>%
+      filter(visit_draw == 1) %>%                                   # NEW: keep drawn visits only
+      select(patient_id, .time, all_of(vars)) %>%
+      rename(!!time_var := .time)
+
+    cat(sprintf("✓ Generated %d patients, %d visits (original scale)\n", n_patients, nrow(synthetic_data)))
+
+    attr(synthetic_data, "history") <- history                   # NEW: for checking convergence
+    synthetic_data
+  }
+
+  syn_list <- map(seq_len(m), draw_one)                           # NEW (pooling): m datasets from one trained model
+  if (m == 1) syn_list[[1]] else syn_list                         # NEW: m = 1 returns a data frame, as before
+}
+```
+
+## Generator: model architecture
+
+```{r generator-model}
+# Sampling layer: reparameterization trick + weighted KL loss     # NEW (replaces layer_lambda, keras3)
+layer_sampling_kl <- Layer(
+  classname = "SamplingKL",
+  initialize = function(seed = 1066, ...) {
+    super$initialize(...)
+    self$seed_generator <- random_seed_generator(seed)
+    self$kl_weight <- self$add_weight(shape = shape(), initializer = "zeros", trainable = FALSE, name = "kl_weight")
+  },
+  call = function(inputs) {
+    z_mean <- inputs[[1]]
+    z_log_var <- inputs[[2]]
+    kl <- -0.5 * op_mean(op_sum(1 + z_log_var - op_square(z_mean) - op_exp(z_log_var), axis = -1))
+    self$add_loss(self$kl_weight * kl)
+    epsilon <- random_normal(shape = op_shape(z_mean), seed = self$seed_generator)
+    z_mean + op_exp(0.5 * z_log_var) * epsilon
+  }
+)
+
+# Day-level sampling layer: reparameterization + KL against a learned AR(1) prior   # SEQ
+# prior: z_1 ~ N(0, 1); z_t | z_(t-1) ~ N(rho * z_(t-1), 1 - rho^2), one rho per latent dimension (learned)
+layer_ar1_sampling_kl <- Layer(
+  classname = "AR1SamplingKL",
+  initialize = function(n_timepoints, dyn_dim, seed = 2024, ...) {
+    super$initialize(...)
+    self$seed_generator <- random_seed_generator(seed)
+    self$kl_weight <- self$add_weight(shape = shape(), initializer = "zeros", trainable = FALSE, name = "kl_weight")
+    self$rho_logit <- self$add_weight(shape = shape(dyn_dim), initializer = "zeros", trainable = TRUE,
+                                      name = "rho_logit")         # one AR(1) coefficient per latent dimension (learned)
+    self$not_first <- op_convert_to_tensor(array(c(0, rep(1, n_timepoints - 1)), c(1, n_timepoints, 1)),
+                                          dtype = "float32")      # 0 at the first time point, 1 after
+  },
+  call = function(inputs) {
+    m  <- inputs[[1]]                                               # [patient, time, dim]
+    lv <- inputs[[2]]
+    epsilon <- random_normal(shape = op_shape(m), seed = self$seed_generator)
+    z <- m + op_exp(0.5 * lv) * epsilon
+    rho <- 0.99 * op_sigmoid(self$rho_logit)                        # in (0, 0.99)
+    prior_mean <- self$not_first * rho * op_roll(z, shift = 1L, axis = 2L)   # rho * previous day (0 on day 1)
+    prior_var  <- 1 - self$not_first * op_square(rho)
+    kl <- 0.5 * (op_log(prior_var) - lv + (op_exp(lv) + op_square(m - prior_mean)) / prior_var - 1)
+    self$add_loss(self$kl_weight * op_mean(op_sum(kl, axis = c(2L, 3L))))
+    z
+  }
+)
+
+# KL warm-up: weight rises linearly from 0 to beta over warmup epochs   # NEW
+callback_kl_warmup <- Callback(
+  classname = "KLWarmup",
+  initialize = function(warmup, beta = 1, beta_dyn = 1) {         # SEQ v2: separate weight for z_t (default 1; Python can't default to another argument)
+    super$initialize()
+    self$warmup <- warmup
+    self$beta <- beta
+    self$beta_dyn <- beta_dyn
+  },
+  on_epoch_begin = function(epoch, logs = NULL) {
+    ramp <- min(1, epoch / max(1, self$warmup))
+    self$model$get_layer("z_sampling")$kl_weight$assign(self$beta * ramp)          # patient level
+    self$model$get_layer("zd_sampling")$kl_weight$assign(self$beta_dyn * ramp)     # SEQ v2: day level
+  }
+)
+
+build_temporal_vae <- function(n_timepoints, encoded, latent_dim = 8,
+                               n_cond = 0,                                       # NEW: conditioning columns
+                               seq_vars = c(encoded$continuous_vars, encoded$categorical_vars),   # NEW
+                               dyn_dim = 4) {                                    # SEQ: day-level latent size
+  #' Build Temporal VAE with LSTM encoder/decoder. If n_cond > 0 it is a conditional VAE: the patient
+  #' traits go to the encoder (at every time point) and to the decoder (with z).
+  #' Feature layout (input and output): value columns | one "observed" column per variable | visit column.
+
+  n_values   <- ncol(encoded$matrix)                                # NEW
+  n_vars     <- length(seq_vars)
+  n_features <- n_values + n_vars + 1                               # CHANGED: values | observed | visit
+  n_cont     <- length(encoded$continuous_vars)
+  to_tensor  <- function(x) op_convert_to_tensor(x, dtype = "float32")
+  cont_mask  <- to_tensor(c(rep(1, n_cont), rep(0, n_values - n_cont), rep(0, n_vars + 1)))
+  cat_mask   <- to_tensor(c(rep(0, n_cont), rep(1, n_values - n_cont), rep(0, n_vars + 1)))
+  obs_cols   <- to_tensor(c(rep(0, n_values), rep(1, n_vars), 0))
+  visit_col  <- to_tensor(c(rep(0, n_values + n_vars), 1))
+  val_names  <- colnames(encoded$matrix)                            # maps each "observed" column to its value columns
+  obs_map <- rbind(matrix(0, n_values, n_features),
+                   do.call(rbind, map(seq_vars, ~ c(as.numeric(val_names == .x | startsWith(val_names, paste0(.x, "__"))),
+                                                    rep(0, n_vars + 1)))),
+                   matrix(0, 1, n_features)) %>% to_tensor()
+
+  # Encoder
+  input_layer <- keras_input(shape = c(n_timepoints, n_features))
+  if (n_cond > 0) {                                                 # NEW: traits at every time point
+    cond_input <- keras_input(shape = n_cond)
+    encoder_in <- layer_concatenate(list(input_layer, cond_input %>% layer_repeat_vector(n_timepoints)))
+  } else {
+    encoder_in <- input_layer
+  }
+
+  hidden_seq <- encoder_in %>%
+    layer_lstm(64, return_sequences = TRUE)          # CHANGED: default tanh (was relu); no dropout (was 0.2)
+  encoded_seq <- hidden_seq %>%
+    layer_lstm(32, return_sequences = FALSE)         # CHANGED: default tanh (was relu)
+
+  # Latent space: patient level (one z per patient)
+  z_mean    <- encoded_seq %>% layer_dense(latent_dim, name = "z_mean")
+  z_log_var <- encoded_seq %>% layer_dense(latent_dim, name = "z_log_var")
+  z_sampling <- layer_sampling_kl(list(z_mean, z_log_var), name = "z_sampling")
+
+  # SEQ: latent space, day level (one z_t per day), from a bidirectional LSTM (sees days before and after)
+  dyn_seq    <- hidden_seq %>% layer_bidirectional(layer_lstm(units = 32, return_sequences = TRUE))
+  zd_mean    <- dyn_seq %>% layer_dense(dyn_dim, name = "zd_mean")
+  zd_log_var <- dyn_seq %>% layer_dense(dyn_dim, name = "zd_log_var")
+  zd_sampling <- layer_ar1_sampling_kl(list(zd_mean, zd_log_var), n_timepoints = n_timepoints,
+                                       dyn_dim = dyn_dim, name = "zd_sampling")
+
+  # Decoder
+  latent_input <- keras_input(shape = latent_dim)
+  dyn_input    <- keras_input(shape = c(n_timepoints, dyn_dim))     # SEQ: day-level latent path
+  if (n_cond > 0) {                                                 # NEW: decoder gets z + traits
+    dec_cond_input <- keras_input(shape = n_cond)
+    decoder_in <- layer_concatenate(list(latent_input, dec_cond_input))
+  } else {
+    decoder_in <- latent_input
+  }
+
+  decoded <- decoder_in %>%
+    layer_dense(32, activation = "relu") %>%
+    layer_repeat_vector(n_timepoints) %>%
+    list(dyn_input) %>% layer_concatenate() %>%      # SEQ: patient-level part + that day's z_t
+    layer_lstm(64, return_sequences = TRUE)          # CHANGED: default tanh (was relu); no dropout (was 0.2)
+
+  # Output heads: linear (continuous), softmax per categorical, sigmoid for observed / visit   # CHANGED (was one sigmoid layer)
+  output_list <- c(
+    if (n_cont > 0) list(decoded %>% layer_dense(n_cont)),
+    map(encoded$cat_sizes, ~ decoded %>% layer_dense(.x, activation = "softmax")),
+    list(decoded %>% layer_dense(n_vars, activation = "sigmoid"),
+         decoded %>% layer_dense(1, activation = "sigmoid")),
+    if (n_cont > 0) list(decoded %>% layer_dense(n_cont))           # SEQ v2: learned log-variance per continuous value
+  )
+  decoder_outputs <- layer_concatenate(output_list)
+
+  # Decoder model
+  decoder <- keras_model(if (n_cond > 0) list(latent_input, dyn_input, dec_cond_input) else list(latent_input, dyn_input),
+                         decoder_outputs, name = "decoder")         # SEQ: + dyn_input
+
+  # Full VAE model
+  vae <- if (n_cond > 0) {
+    keras_model(list(input_layer, cond_input), decoder(list(z_sampling, zd_sampling, cond_input)), name = "temporal_vae")
+  } else {
+    keras_model(input_layer, decoder(list(z_sampling, zd_sampling)), name = "temporal_vae")   # SEQ: + zd_sampling
+  }
+
+  # VAE loss: reconstruction (KL is added by the sampling layer)   # CHANGED: masked; per-type terms
+  # squared error (continuous) + cross-entropy (categorical) on observed values only,
+  # + binary cross-entropy for "value observed" (at visits) and "visit exists" (all slots)
+  # SEQ v2: decoder output = [means / probabilities | log-variances]; split with selector matrices
+  sel_main   <- to_tensor(rbind(diag(n_features), matrix(0, n_cont, n_features)))
+  sel_logvar <- to_tensor(rbind(matrix(0, n_features, n_features),
+                                cbind(diag(n_cont), matrix(0, n_cont, n_features - n_cont))))
+
+  vae_loss <- function(x_true, x_out) {
+    x_pred  <- op_matmul(x_out, sel_main)                           # SEQ v2: means / probabilities
+    log_var <- op_clip(op_matmul(x_out, sel_logvar), -6, 4)         # SEQ v2: learned log-variance (continuous columns)
+    visit   <- op_sum(x_true * visit_col, axis = -1, keepdims = TRUE)
+    val_wt  <- op_matmul(x_true, obs_map) * visit
+    sq_err  <- 0.5 * (log_var + op_square(x_true - x_pred) * op_exp(-log_var)) * cont_mask * val_wt   # SEQ v2: Gaussian NLL
+    x_ent   <- -x_true * op_log(op_clip(x_pred, 1e-7, 1)) * cat_mask * val_wt
+    bce     <- -(x_true * op_log(op_clip(x_pred, 1e-7, 1)) + (1 - x_true) * op_log(op_clip(1 - x_pred, 1e-7, 1)))
+    op_sum(op_sum(sq_err + x_ent + bce * obs_cols * visit + bce * visit_col, axis = -1), axis = -1)
+  }
+
+  vae %>% compile(optimizer = "adam", loss = vae_loss)
+
+  return(vae)
+}
+```
+
+## Generator: helper functions
+
+```{r generator-helpers}
+auto_detect_var_types <- function(data) {
+  map(data, function(x) {
+    if (is.numeric(x)) "continuous"
+    else if (is.character(x) || is.factor(x)) "categorical"
+    else "other"
+  })
+}
+
+synthesize_traits <- function(real_cond, cond_types, n_patients, seed) {   # NEW (privacy)
+  #' Synthetic patient traits (one row per patient) with synthpop CART, so no real patient's trait combination is
+  #' copied. Continuous traits are smoothed (density), so exact real values are not reused either.
+  syn_in <- real_cond %>% mutate(across(all_of(names(cond_types)[cond_types == "categorical"]), factor)) %>% as.data.frame()
+  smooth <- map(set_names(names(cond_types)[cond_types == "continuous"]), ~ "density")
+  if (length(smooth) == 0) smooth <- NULL
+  syn_out <- synthpop::syn(syn_in, k = n_patients, seed = seed, smoothing = smooth, print.flag = FALSE)$syn
+  syn_out %>% mutate(across(everything(), function(x) {            # back to each trait's original class
+    orig <- real_cond[[cur_column()]]
+    if (is.factor(orig)) factor(x, levels = levels(orig)) else if (is.numeric(orig)) as.numeric(as.character(x)) else as.character(x)
+  })) %>% as_tibble()
+}
+
+draw_dynamic_prior <- function(rho, n_patients, n_timepoints) {   # SEQ v2 (replaces draw_dynamic_latent)
+  #' Day-level latent paths from the learned AR(1) prior: z_1 ~ N(0, 1), z_t = rho * z_(t-1) + sqrt(1 - rho^2) * e_t,
+  #' one rho per latent dimension. Returns [patient, time, dim].
+  paths <- map(rho, ~ matrix(ar1_series(n_patients, n_timepoints, .x), n_patients, n_timepoints, byrow = TRUE))
+  array(unlist(paths), dim = c(n_patients, n_timepoints, length(rho)))
+}
+
+detect_static_vars <- function(data, vars) {                       # NEW
+  #' Variables with a single (non-missing) value within every patient
+  data %>%
+    group_by(patient_id) %>%
+    summarise(across(all_of(vars), ~ n_distinct(.x, na.rm = TRUE)), .groups = "drop") %>%
+    select(-patient_id) %>%
+    map_lgl(~ all(.x <= 1)) %>%
+    which() %>%
+    names()
+}
+
+fit_boxcox_parallel_r <- function(data, var_types) {
+  continuous_vars <- names(var_types[var_types == "continuous"])
+
+  boxcox_list <- map(continuous_vars, function(var) {
+    fit_boxcox_single_r(data[[var]], var)
+  })
+
+  names(boxcox_list) <- continuous_vars
+
+  full_params <- map(names(var_types), function(var) {
+    if (var %in% continuous_vars) boxcox_list[[var]]
+    else list(lambda = NA, shift = 0, fitted = FALSE)
+  })
+  names(full_params) <- names(var_types)
+
+  return(full_params)
+}
+
+fit_boxcox_single_r <- function(vals, var_name) {
+  tryCatch({
+    vals <- as.numeric(vals)
+    vals <- vals[!is.na(vals)]
+
+    if (any(vals <= 0)) {
+      shift <- abs(min(vals)) + 1
+      vals <- vals + shift
+    } else {
+      shift <- 0
+    }
+
+    pt <- car::powerTransform(vals)
+    lambda <- pt$lambda
+
+    list(lambda = lambda, shift = shift, fitted = TRUE)
+  }, error = function(e) {
+    cat(sprintf("  Warning: Box-Cox failed for %s\n", var_name))
+    list(lambda = 1, shift = 0, fitted = FALSE)
+  })
+}
+
+apply_boxcox_parallel_r <- function(data, boxcox_params, var_types) {
+  continuous_vars <- names(var_types[var_types == "continuous"])
+
+  transformed_vars <- map(continuous_vars, function(var) {
+    boxcox_transform_single_r(data[[var]], boxcox_params[[var]])
+  })
+  names(transformed_vars) <- continuous_vars
+
+  result <- data %>% select(-all_of(continuous_vars))
+
+  map2(continuous_vars, transformed_vars, function(var, vals) {
+    result[[var]] <<- vals
+  })
+
+  result %>% select(all_of(names(data)))
+}
+
+boxcox_transform_single_r <- function(vals, boxcox_param) {
+  lambda <- boxcox_param$lambda
+  shift <- boxcox_param$shift
+  vals_shifted <- vals + shift
+
+  if (abs(lambda) < 1e-6) log(vals_shifted)
+  else (vals_shifted^lambda - 1) / lambda
+}
+
+fit_marginals_r <- function(data, var_types) {
+  map2(names(var_types), var_types, function(var, type) {
+    if (type == "continuous") {
+      list(type = "continuous", mean = mean(data[[var]], na.rm = TRUE), sd = sd(data[[var]], na.rm = TRUE))  # CHANGED: na.rm
+    } else if (type == "categorical") {
+      unique_vals <- sort(unique(data[[var]]))
+      list(type = "categorical", levels = unique_vals, n_levels = length(unique_vals))
+    }
+  }) %>%
+    set_names(names(var_types))   # CHANGED: added so marginals[[var]] works
+}
+
+standardize_data_r <- function(data, marginals, var_types) {
+  continuous_vars <- names(var_types[var_types == "continuous"])
+  data %>%                                                         # CHANGED: across() instead of for loop
+    mutate(across(all_of(continuous_vars),
+                  ~ (.x - marginals[[cur_column()]]$mean) / marginals[[cur_column()]]$sd))
+}
+
+encode_features <- function(data, marginals, var_types) {          # NEW
+  #' Continuous columns as-is; categorical columns one-hot (named var__level; missing = all zeros)
+  continuous_vars  <- names(var_types[var_types == "continuous"])
+  categorical_vars <- names(var_types[var_types == "categorical"])
+  cat_blocks <- map(categorical_vars, function(var) {
+    lv <- marginals[[var]]$levels
+    m <- outer(as.character(data[[var]]), as.character(lv), "==") * 1
+    m[is.na(m)] <- 0
+    colnames(m) <- paste0(var, "__", lv)
+    m
+  })
+  mat <- do.call(cbind, c(list(as.matrix(data[continuous_vars])), cat_blocks))
+  storage.mode(mat) <- "double"
+  list(matrix = mat, continuous_vars = continuous_vars, categorical_vars = categorical_vars,
+       cat_sizes = map_int(categorical_vars, ~ marginals[[.x]]$n_levels))
+}
+
+reshape_to_sequences <- function(mat, n_patients, n_timepoints) {  # CHANGED: no for loop
+  #' Rows ordered patient-major, time-minor -> array [patient, time, feature]
+  aperm(array(mat, dim = c(n_timepoints, n_patients, ncol(mat))), c(2, 1, 3))
+}
+
+sequences_to_matrix <- function(arr) {                             # NEW
+  #' Array [patient, time, feature] -> rows ordered patient-major, time-minor
+  matrix(aperm(arr, c(2, 1, 3)), ncol = dim(arr)[3])
+}
+
+sample_categories <- function(p, u = runif(nrow(p))) {             # NEW (u: CHANGED, added for fix 4)
+  #' One category index per row from a matrix of probabilities, using uniform numbers u
+  p <- p / rowSums(p)
+  cum <- p %*% upper.tri(diag(ncol(p)), diag = TRUE)               # row-wise cumulative sums
+  pmin(rowSums(u > cum) + 1, ncol(p))
+}
+
+ar1_series <- function(n_patients, n_timepoints, rho) {             # NEW (fix 3, 4)
+  #' Standard-normal AR(1) series per patient (lag-1 correlation rho), rows patient-major, time-minor
+  e <- matrix(rnorm(n_patients * n_timepoints), n_timepoints)        # time x patient
+  e[-1, ] <- e[-1, ] * sqrt(1 - rho^2)                              # keeps variance 1 at every step
+  as.vector(apply(e, 2, stats::filter, filter = rho, method = "recursive"))
+}
+
+estimate_noise_structure <- function(vae_model, model_x, X_train, encoded, col_names,
+                                     static_vars, n_timepoints) {    # NEW (fix 3)
+  #' Reconstruct the real patients from z_mean and describe, per continuous variable, what the model misses:
+  #' patient-level intercept and slope (covariance G), lag-1 correlation of the rest (rho) and its SD (sigma),
+  #' from lmer(residual ~ 1 + time + (1 + time | patient)) on observed values (standardized scale).
+  decoder <- get_layer(vae_model, "decoder")
+  z_mean_out  <- get_layer(vae_model, "z_mean")$output
+  zd_mean_out <- get_layer(vae_model, "zd_mean")$output           # SEQ
+  mean_model <- keras_model(vae_model$inputs,
+                            decoder(if (is.list(model_x)) list(z_mean_out, zd_mean_out, vae_model$inputs[[2]])
+                                    else list(z_mean_out, zd_mean_out)))
+  X_mat <- sequences_to_matrix(X_train); colnames(X_mat) <- col_names
+  resid <- X_mat - sequences_to_matrix(mean_model %>% predict(model_x, verbose = 0))[, seq_len(ncol(X_mat))]   # SEQ v2: drop log-variance columns
+  colnames(resid) <- col_names
+  pid <- rep(seq_len(dim(X_train)[1]), each = n_timepoints)
+  tt  <- rep((seq_len(n_timepoints) - 1) / max(1, n_timepoints - 1), dim(X_train)[1])
+  map(set_names(encoded$continuous_vars), function(v) {
+    obs <- X_mat[, paste0(v, "__observed")] == 1
+    d <- tibble(r = resid[obs, v], tt = tt[obs], pid = pid[obs])
+    if (v %in% static_vars) return(list(static_sd = sd(tapply(d$r, d$pid, mean)), G = matrix(0, 2, 2), rho = 0, sigma = 0))
+    fit <- tryCatch(suppressWarnings(suppressMessages(lme4::lmer(r ~ 1 + tt + (1 + tt | pid), d, REML = FALSE))),
+                    error = function(e) NULL)
+    if (is.null(fit)) return(list(G = matrix(0, 2, 2), rho = 0, sigma = sd(d$r), static_sd = 0))
+    e <- tibble(pid = d$pid, tt = d$tt, e = resid(fit)) %>% group_by(pid) %>%
+      mutate(prev = lag(e), gap = tt - lag(tt)) %>% ungroup() %>%
+      filter(abs(gap - 1 / max(1, n_timepoints - 1)) < 1e-9)          # consecutive grid slots only
+    rho <- if (nrow(e) > 10) min(max(cor(e$e, e$prev), 0), 0.95) else 0
+    list(G = as.matrix(lme4::VarCorr(fit)$pid)[1:2, 1:2], rho = rho, sigma = sigma(fit), static_sd = 0)
+  })
+}
+
+estimate_cat_persistence <- function(data_grid, categorical_vars, static_vars) {   # NEW (fix 4)
+  #' Per time-varying categorical variable: how strongly a patient's value persists from one visit to the
+  #' next (lag-1 correlation of "same as the most common level" between consecutive visits), converted to the
+  #' correlation of the underlying normal (sin(pi/2 * r), Greiner's relation). Used to draw categories with
+  #' AR(1) random numbers so values do not flip at random between days.
+  map_dbl(set_names(setdiff(categorical_vars, static_vars)), function(v) {
+    d <- data_grid %>% filter(!is.na(.data[[v]])) %>%
+      mutate(top = as.numeric(.data[[v]] == names(which.max(table(.data[[v]]))))) %>%
+      group_by(patient_id) %>% mutate(prev = lag(top)) %>% ungroup() %>% filter(!is.na(prev))
+    r <- if (nrow(d) > 10 && sd(d$top) > 0 && sd(d$prev) > 0) cor(d$top, d$prev) else 0
+    min(max(sin(pi / 2 * r), 0), 0.99)
+  })
+}
+
+decode_features <- function(mat, encoded, marginals, static_vars, n_timepoints,
+                            noise = NULL, cat_persistence = NULL) {  # NEW (noise, cat_persistence: fix 3, 4)
+  #' Decoder output -> tibble on the standardized Box-Cox scale (categorical as levels).
+  #' Time-invariant variables: one value per patient. Continuous: + patient-level intercept/slope noise
+  #' + AR(1) noise (fix 3). Time-varying categorical: drawn with AR(1) random numbers (fix 4).
+  n_pat <- nrow(mat) / n_timepoints
+  pid <- rep(seq_len(n_pat), each = n_timepoints)
+  tt  <- rep((seq_len(n_timepoints) - 1) / max(1, n_timepoints - 1), n_pat)
+
+  cont <- map(set_names(encoded$continuous_vars), function(var) {
+    v <- mat[, var]
+    s <- noise[[var]]
+    if (var %in% static_vars) return(ave(v, pid) + rnorm(n_pat, 0, if (is.null(s)) 0 else s$static_sd)[pid])
+    if (is.null(s)) return(v)
+    ab <- MASS::mvrnorm(n_pat, c(0, 0), s$G)                       # patient intercept and slope
+    v + ab[pid, 1] + ab[pid, 2] * tt + s$sigma * ar1_series(n_pat, n_timepoints, s$rho)
+  })
+
+  cats <- map(set_names(encoded$categorical_vars), function(var) {
+    lv <- marginals[[var]]$levels
+    p <- mat[, paste0(var, "__", lv), drop = FALSE]
+    idx <- if (var %in% static_vars) {
+      sample_categories(rowsum(p, pid) / n_timepoints)[pid]
+    } else {
+      rho <- if (is.null(cat_persistence)) 0 else cat_persistence[[var]]
+      sample_categories(p, pnorm(ar1_series(n_pat, n_timepoints, rho)))   # CHANGED (fix 4): persistent draws
+    }
+    lv[idx]
+  })
+
+  as_tibble(c(cont, cats))
+}
+
+build_value_maps <- function(data_orig, data_std, var_types) {      # NEW (fix 1, 2)
+  #' For each continuous variable: its observed values paired with their standardized Box-Cox values (sorted),
+  #' and how to format output values: snap = TRUE if 30 or fewer distinct values; else round to observed decimals.
+  continuous_vars <- names(var_types[var_types == "continuous"])
+  map(set_names(continuous_vars), function(var) {
+    keep  <- !is.na(data_orig[[var]])
+    pairs <- distinct(tibble(std = data_std[[var]][keep], orig = data_orig[[var]][keep])) %>% arrange(std)
+    support <- sort(unique(pairs$orig))
+    list(std = pairs$std, orig = pairs$orig, snap = length(support) <= 30,
+         digits = detect(0:6, ~ all(abs(support * 10^.x - round(support * 10^.x)) < 1e-8), .default = 6),
+         orig_all = sort(data_orig[[var]][keep]))
+  })
+}
+
+map_to_observed_r <- function(data, value_maps) {                  # NEW (fix 1, 2)
+  #' Standardized Box-Cox scale -> original scale by interpolating between observed (std, value) pairs: the same
+  #' as the inverse Box-Cox inside the observed range, held at the observed min / max outside it (no NaN).
+  #' Discrete variables (30 or fewer values) are mapped by rank, so each value keeps its real share.
+  data %>%
+    mutate(across(all_of(names(value_maps)), function(y) {
+      m <- value_maps[[cur_column()]]
+      if (length(m$orig) < 2) return(ifelse(is.na(y), NA, m$orig[1]))
+      if (m$snap) {
+        p <- (rank(y, na.last = "keep", ties.method = "random") - 0.5) / sum(!is.na(y))
+        ifelse(is.na(y), NA, quantile(m$orig_all, p, type = 1, names = FALSE))
+      } else {
+        round(approx(m$std, m$orig, xout = y, rule = 2, ties = mean)$y, m$digits)
+      }
+    }))
+}
+```
+
+## References
+
+- Kingma, D. P., & Welling, M. (2014). Auto-encoding variational Bayes. *ICLR*. arXiv:1312.6114.
+- Hochreiter, S., & Schmidhuber, J. (1997). Long short-term memory. *Neural Computation*, 9(8), 1735–1780.
+- Fabius, O., & van Amersfoort, J. R. (2015). Variational recurrent auto-encoders. arXiv:1412.6581.
+- Bowman, S. R., et al. (2016). Generating sentences from a continuous space. *CoNLL*. (KL warm-up, posterior collapse.)
+- Higgins, I., et al. (2017). β-VAE. *ICLR*. (KL weight.)
+- Ghosh, P., et al. (2020). From variational to deterministic autoencoders. *ICLR*. arXiv:1903.12436. (Sampling z from the fitted latent distribution.)
+- Nazábal, A., Olmos, P. M., Ghahramani, Z., & Valera, I. (2020). Handling incomplete heterogeneous data using VAEs. *Pattern Recognition*, 107. (Masked likelihood, mixed types.)
+- Desai, A., et al. (2021). TimeVAE. arXiv:2111.08095.
+- Box, G. E. P., & Cox, D. R. (1964). An analysis of transformations. *JRSS-B*, 26(2), 211–252.
+- Sohn, K., Lee, H., & Yan, X. (2015). Learning structured output representation using deep conditional generative models. *NeurIPS*. (Conditional VAE; NEW.)
+- Diggle, P., Heagerty, P., Liang, K.-Y., & Zeger, S. (2002). *Analysis of Longitudinal Data* (2nd ed.), ch. 10: transition models. (NEW.)
+- Laird, N. M., & Ware, J. H. (1982). Random-effects models for longitudinal data. *Biometrics*, 38(4), 963–974. (Patient-level intercept/slope in the noise; fix 3.)
+- Box, G. E. P., Jenkins, G. M., Reinsel, G. C., & Ljung, G. M. (2015). *Time Series Analysis* (5th ed.). Wiley. (AR(1) noise; fix 3, 4.)
+- Gudmundsson, L., et al. (2012). Downscaling RCM precipitation to the station scale using quantile mapping. *HESS*, 16(9), 3383–3390. (Back to observed values; fix 1, 2.)

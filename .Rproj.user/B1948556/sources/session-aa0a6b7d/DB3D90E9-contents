@@ -1,0 +1,86 @@
+---
+title: "PART 1 - PAR Synthetic Data Generator (SDV PARSynthesizer)"
+author: "Piers Seidman"
+date: "2026-11-17"
+output: html_document
+---
+
+ SDV's PARSynthesizer (Python), run from R with reticulate.
+ This is a python package that does exactly what we wanted to replicate with our VAE
+PAR (probabilistic autoregressive) builds each synthetic patient day by day: an RNN predicts the distribution of the next day's values given the patient's earlier days given constant traits
+A gausian copula identifies the traits
+Reference: Zhang et al. 2022, Sequential Models in the Synthetic Data Vault (arXiv 2207.14406).
+
+
+```{r libraries, message=FALSE, warning=FALSE}
+library(reticulate)
+py_require(packages = "sdv", python_version = "3.12")   # installs SDV (with torch) the first time; must run before Python starts
+library(tidyverse)
+```
+
+
+```{r generator-par}
+generate_synthetic_par <- function(
+  real_data,
+  id_var = "participant_id",          # one sequence per patient
+  time_var = "Days_since_bio",        # order within a patient (gaps allowed)
+  context_vars,                       # traits: constant within patient, never missing
+  categorical_vars = character(0),    # numeric columns to model as categories (e.g. 0/1 steroid)
+  epochs = 128,                       # SDV default
+  seed = 1,
+  m = 1,                              # number of synthetic datasets from the one trained model
+  verbose = FALSE
+) {
+
+  #' Generate synthetic longitudinal data with SDV's PARSynthesizer (Python, through reticulate)
+  #'
+  #' @return Data frame with the same columns as real_data (new patient IDs), or a list of m of them
+
+  # ---- Python modules ----
+  sdv_metadata   <- import("sdv.metadata")
+  sdv_sequential <- import("sdv.sequential")
+  torch          <- import("torch")
+  np             <- import("numpy")
+
+  # ---- Seeds (R, numpy, torch) ----
+  set.seed(seed)
+  np$random$seed(as.integer(seed))
+  torch$manual_seed(as.integer(seed))
+
+  # ---- Data for Python: patient ID as text, rows in time order ----
+  real_py <- real_data %>%
+    mutate(!!id_var := as.character(.data[[id_var]])) %>%
+    arrange(.data[[id_var]], .data[[time_var]]) %>% #arrange by pid and time
+    as.data.frame()
+  data_py <- dict(corsano = r_to_py(real_py))   # SDV takes a dict: table name -> data frame
+
+  # ---- Metadata: column types, patient ID, time order ----
+  metadata <- sdv_metadata$Metadata$detect_from_dataframes(data = data_py)
+  metadata$update_column(column_name = id_var, sdtype = "id", table_name = "corsano")
+  metadata$set_sequence_key(column_name = id_var, table_name = "corsano")
+  metadata$set_sequence_index(column_name = time_var, table_name = "corsano")
+  walk(categorical_vars, ~ metadata$update_column(column_name = .x, sdtype = "categorical", table_name = "corsano"))
+
+  # ---- Train ----
+  synthesizer <- sdv_sequential$PARSynthesizer(metadata,
+                                               context_columns = as.list(context_vars),
+                                               epochs = as.integer(epochs),
+                                               verbose = verbose,
+                                               cuda = FALSE)
+  synthesizer$fit(data_py)
+  cat("✓ PARSynthesizer trained\n")
+
+  # ---- Sample m datasets, same number of patients as the real data ----
+  n_patients <- n_distinct(real_py[[id_var]])
+  syn_list <- map(seq_len(m), function(i) {
+    out <- synthesizer$sample_sequences(num_sequences = as.integer(n_patients))[["corsano"]] %>%
+      as_tibble() %>%
+      select(all_of(names(real_data))) %>%              # same column order as the input
+      mutate(across(where(is.numeric), ~ replace(.x, is.nan(.x), NA)))   # Python NaN -> R NA
+    cat(sprintf("✓ Generated %d patients, %d patient-days\n", n_distinct(out[[id_var]]), nrow(out)))
+    out
+  })
+
+  if (m == 1) syn_list[[1]] else syn_list
+}
+```

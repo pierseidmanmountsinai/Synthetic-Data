@@ -1,0 +1,421 @@
+---
+title: "Temporal VAE — Validation on Janssen Daily Wearable Data"
+output: html_document
+---
+
+Generates synthetic versions of the daily Corsano data with the temporal VAE and checks them two ways:
+
+1. **Utility (synthpop workflow, Raab, Nowok & Dibben):** `utility.gen()` with a CART propensity model
+   (VAE vs synthpop's own `syn()` as a benchmark), `compare()` one-way, `utility.tables()` two-way,
+   `utility.tab()` per variable, plus ECDF / KS. Run on patient-days and on a **patient-level summary table**
+   (per-patient mean, SD, slope, visits) so the longitudinal structure is also tested.
+2. **Transfer test:** the PART 4 daily spline model (`Model4WearablesV2_DailyMeans`) run on the real and the
+   synthetic data, comparing BIC knot choice, bi-weekly emmeans, Non-Responder vs Responder contrasts and
+   within-class change from baseline.
+
+**Data changes (flagged):** `participant_id` is passed to the generator as `patient_id` and renamed back;
+`sex_birth` and `on_any_steroid` are passed as factors (categorical) and converted back for the models.
+Only the 7 key variables and the PART 4 covariates are used.
+
+```{r setup, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(keras3)
+library(car)
+library(nlme)
+library(lme4)
+library(splines)
+library(emmeans)
+library(synthpop)
+
+main_rmd     <- "generate_synthetic_longitudinal_temporal_vae_v2.Rmd"                 # in the working directory
+data_file    <- "H:/WearableBiologicsJJ/Data_for_Analysis/Daily_Final_DB_With_Response_Class.rda"
+orig_results <- "H:/WearableBiologicsJJ/Daily_Estimates/Model_Results_DailyMeans.xlsx"  # PART 4 results
+out_dir      <- "Janssen_Validation"
+dir.create(out_dir, showWarnings = FALSE)
+
+# Load the generator and validation functions (code of every chunk before the main file's test section)
+rmd <- readLines(main_rmd)
+rmd <- rmd[seq_len(grep("^```\\{r test-data", rmd)[1] - 1)]
+chunk_starts <- grep("^```\\{r", rmd)
+chunk_ends <- map_int(chunk_starts, ~ grep("^```\\s*$", rmd)[grep("^```\\s*$", rmd) > .x][1])
+eval(parse(text = unlist(map2(chunk_starts, chunk_ends, ~ rmd[(.x + 1):(.y - 1)]))))
+
+seeds <- 1:5
+key_vars <- c("Core_Body_Temperature_daily", "Skin_Contact_Temperature_daily", "respiration_daily",
+              "hrvAnalysis_sdnn_daily", "hrvAnalysis_rmssd_daily", "hrvAnalysis_min_hr_daily", "hrvAnalysis_mean_hr_daily")
+covs <- c("age_at_enrollment", "sex_birth", "bmi", "on_any_steroid")
+cond_vars <- c("resp_class_final", "sex_birth", "age_at_enrollment", "bmi")
+max_days <- 98
+```
+
+## Data
+
+```{r data}
+load(data_file)
+real <- Daily_Corsano_DB_ADJ_Response %>%
+  select(participant_id, Days_since_bio, all_of(key_vars), all_of(covs), resp_class_final)
+
+for_generator <- real %>%                                        # DATA CHANGE (flagged above)
+  rename(patient_id = participant_id) %>%
+  mutate(sex_birth = factor(sex_birth), on_any_steroid = factor(on_any_steroid))
+
+back_to_original <- function(syn) {                              # undo the generator-only changes
+  syn %>%
+    rename(participant_id = patient_id) %>%
+    mutate(participant_id = as.character(participant_id),
+           sex_birth = as.character(sex_birth),
+           on_any_steroid = as.numeric(as.character(on_any_steroid)))
+}
+
+tibble(patients = n_distinct(real$participant_id), rows = nrow(real),
+       median_days = median(table(real$participant_id)))
+```
+
+## Generate synthetic data (VAE) and the synthpop benchmark
+
+```{r generate, results = "hide", message = FALSE, warning = FALSE}
+vae_list <- map(seeds, function(s) {
+  generate_synthetic_temporal_vae(for_generator, seed = s, verbose = 0,
+                                  time_var = "Days_since_bio", cond_vars = cond_vars) %>%
+    back_to_original()
+})
+
+# Benchmark: synthpop CART synthesis of patient-day rows (cross-sectional: ignores who the rows belong to)
+# syn() fails on these NA columns in remove.lindep(), so NA is coded as -999 and declared with cont.na
+na_vars <- key_vars[map_lgl(key_vars, ~ anyNA(real[[.x]]))]
+bench_input <- real %>%
+  select(-participant_id) %>%
+  mutate(sex_birth = factor(sex_birth), on_any_steroid = factor(on_any_steroid),
+         across(all_of(na_vars), ~ replace(.x, is.na(.x), -999))) %>%
+  as.data.frame()
+syn_bench <- syn(bench_input, m = length(seeds), seed = 1, print.flag = FALSE,
+                 cont.na = set_names(rep(list(-999), length(na_vars)), na_vars))
+bench_list <- map(syn_bench$syn, ~ .x %>%
+  mutate(across(all_of(na_vars), ~ replace(.x, .x == -999, NA)),
+         sex_birth = as.character(sex_birth), on_any_steroid = as.numeric(as.character(on_any_steroid))))
+
+saveRDS(list(vae = vae_list, synthpop = bench_list), file.path(out_dir, "synthetic_datasets.rds"))
+```
+
+```{r generated-structure}
+structure_summary <- function(d) {
+  tibble(rows = nrow(d),
+         share_of_patient_days = nrow(d) / (65 * 101),
+         median_days_per_patient = median(table(d$participant_id)),
+         na_core_temp = mean(is.na(d$Core_Body_Temperature_daily)),
+         na_skin_temp = mean(is.na(d$Skin_Contact_Temperature_daily)),
+         na_respiration = mean(is.na(d$respiration_daily)))
+}
+bind_rows(real = structure_summary(real),
+          vae_median = map_dfr(vae_list, structure_summary) %>% summarise(across(everything(), median)),
+          .id = "data")
+```
+
+## 1. Utility — patient-days
+
+`utility.gen()`: a CART model tries to tell real rows from synthetic rows. **S_pMSE** compares its
+success with what chance gives: about 1 is ideal; below 3 is good, below 10 acceptable (Raab et al.).
+
+```{r utility-rows, message = FALSE, warning = FALSE}
+row_vars <- c("Days_since_bio", key_vars, covs, "resp_class_final")
+# synthpop needs plain data.frames with factors; its list methods fail here, so each seed is run on its own
+prep_rows <- function(d) as.data.frame(d[row_vars]) %>%
+  mutate(sex_birth = factor(sex_birth), on_any_steroid = factor(on_any_steroid))
+vae_rows   <- map(vae_list, prep_rows)
+bench_rows <- map(bench_list, prep_rows)
+real_rows  <- prep_rows(real)
+
+ug_per_seed <- function(syn_list, real_df) {
+  map_dfr(syn_list, function(s) {
+    u <- utility.gen(s, real_df, method = "cart", print.flag = FALSE)
+    tibble(pMSE = u$pMSE, S_pMSE = u$S_pMSE)
+  }, .id = "seed")
+}
+ug_vae   <- ug_per_seed(vae_rows, real_rows)
+ug_bench <- ug_per_seed(bench_rows, real_rows)
+
+utility_overall <- bind_rows(`Temporal VAE` = ug_vae, `synthpop syn() (cross-sectional)` = ug_bench, .id = "method") %>%
+  group_by(method) %>%
+  summarise(pMSE = mean(pMSE), S_pMSE_mean = mean(S_pMSE), S_pMSE_min = min(S_pMSE), S_pMSE_max = max(S_pMSE),  # CHANGED: was S_pMSE = mean (overwrote it before min/max)
+            .groups = "drop")
+utility_overall
+```
+
+```{r utility-oneway, fig.width = 12, fig.height = 10, message = FALSE, warning = FALSE}
+cmp <- compare(vae_rows[[1]], real_rows, vars = c(key_vars, "Days_since_bio"), nrow = 3, ncol = 3, print.flag = FALSE)  # seed 1
+cmp$tab.utility   # one-way utility per variable
+png(file.path(out_dir, "compare_oneway.png"), width = 2400, height = 2000, res = 200); print(cmp$plots); dev.off()
+cmp$plots
+```
+
+```{r utility-twoway, fig.width = 10, fig.height = 9, message = FALSE, warning = FALSE}
+ut2 <- utility.tables(vae_rows[[1]], real_rows, tables = "twoway", print.flag = FALSE)   # seed 1
+ggsave(file.path(out_dir, "utility_twoway.png"), ut2$utility.plot, width = 10, height = 9, dpi = 200)
+ut2$utility.plot
+twoway_s <- ut2$tabs[, "S_pMSE"]
+twoway_summary <- tibble(n_tables = length(twoway_s),
+                         median_S_pMSE = median(twoway_s), max_S_pMSE = max(twoway_s),
+                         share_below_3 = mean(twoway_s < 3), share_below_10 = mean(twoway_s < 10))
+twoway_summary
+twoway_worst <- tibble(pair = rownames(ut2$tabs), S_pMSE = twoway_s) %>% arrange(desc(S_pMSE)) %>% head(8)
+twoway_worst
+```
+
+```{r utility-tab, message = FALSE, warning = FALSE}
+# utility.tab(): binned one-way tables, one variable at a time
+utility_tab_by_var <- map_dfr(set_names(c("Days_since_bio", key_vars)), function(v) {
+  s_vals <- map_dbl(vae_rows, ~ utility.tab(.x, real_rows, vars = v, ngroups = 10, print.flag = FALSE)$S_pMSE)
+  tibble(S_pMSE_mean = mean(s_vals), S_pMSE_min = min(s_vals), S_pMSE_max = max(s_vals))
+}, .id = "variable")
+utility_tab_by_var
+```
+
+## 2. CDFs — ECDF overlay and KS distance
+
+```{r ecdf, fig.width = 12, fig.height = 8, message = FALSE, warning = FALSE}
+ecdf_data <- bind_rows(
+  real %>% select(all_of(key_vars)) %>% mutate(source = "Real"),
+  bind_rows(vae_list) %>% select(all_of(key_vars)) %>% mutate(source = "Synthetic (5 seeds)")
+) %>% pivot_longer(-source, names_to = "variable", values_to = "value") %>% filter(!is.na(value))
+
+ks_by_var <- ecdf_data %>%
+  group_by(variable) %>%
+  summarise(KS_D = suppressWarnings(ks.test(value[source == "Real"], value[source != "Real"])$statistic), .groups = "drop")
+ks_by_var
+
+p_ecdf <- ggplot(ecdf_data, aes(value, colour = source)) +
+  stat_ecdf(linewidth = 0.7) +
+  facet_wrap(~ variable, scales = "free_x", ncol = 4) +
+  scale_colour_manual(values = c("Real" = "#14213D", "Synthetic (5 seeds)" = "#E07B39")) +
+  labs(x = NULL, y = "Cumulative proportion", colour = NULL) +
+  theme_minimal(base_size = 13) + theme(legend.position = "bottom")
+ggsave(file.path(out_dir, "ecdf.png"), p_ecdf, width = 12, height = 7, dpi = 200)
+p_ecdf
+```
+
+## 3. Utility — patient level (longitudinal structure)
+
+Per patient: number of days, last day, and per variable the mean, SD and slope over `Days_since_bio`.
+
+```{r patient-summary, message = FALSE, warning = FALSE}
+patient_summary <- function(d) {
+  slope <- function(y, x) { ok <- !is.na(y); if (sum(ok) < 3) NA_real_ else unname(coef(lm(y[ok] ~ x[ok]))[2]) }
+  d %>%
+    group_by(participant_id) %>%
+    summarise(
+      n_days = n(), last_day = max(Days_since_bio),
+      across(all_of(key_vars), list(mean = ~ mean(.x, na.rm = TRUE), sd = ~ sd(.x, na.rm = TRUE),
+                                    slope = ~ slope(.x, Days_since_bio))),
+      resp_class_final = first(resp_class_final), sex_birth = first(sex_birth),
+      age_at_enrollment = first(age_at_enrollment), bmi = first(bmi),
+      .groups = "drop"
+    ) %>%
+    select(-participant_id) %>%
+    mutate(across(where(is.numeric), ~ replace(.x, is.nan(.x), NA)),
+           sex_birth = factor(sex_birth)) %>%
+    as.data.frame()                                              # synthpop needs data.frame
+}
+real_pat <- patient_summary(real)
+vae_pat  <- map(vae_list, patient_summary)
+
+patient_level_overall <- ug_per_seed(vae_pat, real_pat) %>%
+  summarise(pMSE = mean(pMSE), S_pMSE_mean = mean(S_pMSE), S_pMSE_min = min(S_pMSE), S_pMSE_max = max(S_pMSE))
+patient_level_overall
+
+pat_vars <- c("n_days", "last_day", paste0(rep(key_vars, each = 3), c("_mean", "_sd", "_slope")))
+patient_level_by_var <- map_dfr(set_names(pat_vars), function(v) {
+  s_vals <- map_dbl(vae_pat, ~ utility.tab(.x, real_pat, vars = v, ngroups = 5, print.flag = FALSE)$S_pMSE)
+  tibble(S_pMSE_mean = mean(s_vals))
+}, .id = "variable")
+patient_level_by_var
+```
+
+## 4. Transfer test — PART 4 daily spline model
+
+Same model as `Model4WearablesV2_DailyMeans`: `lme(y ~ resp_class * ns(time, df = k + 1) + covariates,
+random = ~ time | participant_id, method = "ML")`, k = 0…8 knots, best by BIC; emmeans every 14 days;
+within-class change vs day 0 (`trt.vs.ctrl`); Non-Responder − Responder contrast; no p-value adjustment.
+
+```{r daily-model}
+fit_daily_model <- function(d, var) {
+  dd <- d %>%
+    rename(time_var = Days_since_bio) %>%
+    mutate(y = as.numeric(.data[[var]]), resp_class = factor(resp_class_final)) %>%
+    filter(!is.na(y)) %>%
+    select(participant_id, y, time_var, resp_class, all_of(covs))
+  cov_rhs <- paste0(" + ", paste(covs, collapse = " + "))
+  fits <- map(0:8, function(k) {
+    time_term <- if (k == 0) "time_var" else paste0("ns(time_var, df = ", k + 1, ")")
+    fm <- as.formula(paste0("y ~ resp_class * ", time_term, cov_rhs))
+    tryCatch(lme(fixed = fm, random = ~ time_var | participant_id, data = dd, na.action = na.omit, method = "ML"),
+             error = function(e) NULL)
+  })
+  bic <- map_dbl(fits, ~ if (is.null(.x)) Inf else BIC(.x))
+  if (all(is.infinite(bic))) return(NULL)                         # every knot model failed (PART 4 also returns NULL)
+  f <- fits[[which.min(bic)]]
+  seq_intervals <- seq(0, max_days, by = 14)
+  em <- emmeans(f, ~ time_var | resp_class, at = list(time_var = seq_intervals), data = dd)
+  means <- as.data.frame(em) %>% mutate(time_var = as.numeric(as.character(time_var)))
+  within <- contrast(em, method = "trt.vs.ctrl", adjust = "none") %>% as.data.frame() %>%
+    mutate(time_var = as.numeric(gsub("[^0-9]", "", gsub(" - .*", "", contrast)))) %>%
+    select(resp_class, time_var, p_within = p.value)
+  between <- emmeans(f, pairwise ~ resp_class | time_var, at = list(time_var = seq_intervals),
+                     adjust = "none", data = dd)$contrasts %>% as.data.frame() %>%
+    filter(contrast == "Non_Responder - Responder") %>%
+    mutate(time_var = as.numeric(as.character(time_var))) %>%
+    select(time_var, estimate, SE, p_between = p.value)
+  cov_terms <- tidy_fixef_lme(f) %>% filter(term %in% c("age_at_enrollment", "sex_birthMale", "bmi", "on_any_steroid"))
+  list(best_knots = which.min(bic) - 1, means = means, within = within, between = between, cov_terms = cov_terms)
+}
+
+tidy_fixef_lme <- function(f) {
+  tibble(term = names(fixef(f)), estimate = unname(fixef(f)), se = unname(sqrt(diag(vcov(f)))))
+}
+```
+
+```{r run-models, message = FALSE, warning = FALSE}
+real_fits <- map(set_names(key_vars), ~ fit_daily_model(real, .x))
+syn_fits  <- map(vae_list, function(s) map(set_names(key_vars), ~ fit_daily_model(s, .x)))
+saveRDS(list(real = real_fits, synthetic = syn_fits), file.path(out_dir, "model_fits.rds"))
+```
+
+```{r check-replica}
+# The real-data refit should reproduce the PART 4 results file
+orig_est <- readxl::read_excel(orig_results, sheet = "Estimates_BiWeekly") %>% filter(variable %in% key_vars)
+replica_check <- imap_dfr(real_fits, ~ .x$means %>% mutate(variable = .y)) %>%
+  inner_join(orig_est, by = c("variable", "time_var", "resp_class"), suffix = c("_refit", "_orig")) %>%
+  summarise(max_abs_diff_emmean = max(abs(emmean_refit - emmean_orig)), n = n())
+replica_check
+```
+
+```{r transfer-summary}
+transfer_by_var <- map_dfr(set_names(key_vars), function(v) {
+  r <- real_fits[[v]]
+  per_seed <- map_dfr(syn_fits, function(sf) {
+    s <- sf[[v]]
+    if (is.null(s)) return(tibble(knots_synth = NA_real_, emmean_ci_overlap = NA_real_,   # model failed on this seed
+                                  between_decision_agree = NA_real_, within_decision_agree = NA_real_))
+    m <- inner_join(r$means, s$means, by = c("time_var", "resp_class"), suffix = c("_r", "_s"))
+    b <- inner_join(r$between, s$between, by = "time_var", suffix = c("_r", "_s"))
+    w <- inner_join(r$within, s$within, by = c("resp_class", "time_var"), suffix = c("_r", "_s"))
+    tibble(
+      knots_synth = s$best_knots,
+      emmean_ci_overlap = median(ci_overlap(m$emmean_r, m$SE_r, m$emmean_s, m$SE_s)),
+      between_decision_agree = mean((b$p_between_r < 0.05) == (b$p_between_s < 0.05)),
+      within_decision_agree  = mean((w$p_within_r < 0.05) == (w$p_within_s < 0.05))
+    )
+  })
+  tibble(knots_real = r$best_knots,
+         knots_synth = paste(per_seed$knots_synth, collapse = ","),
+         failed_fits = sum(is.na(per_seed$knots_synth)),
+         emmean_ci_overlap = median(per_seed$emmean_ci_overlap, na.rm = TRUE),
+         between_decision_agree = mean(per_seed$between_decision_agree, na.rm = TRUE),
+         within_decision_agree = mean(per_seed$within_decision_agree, na.rm = TRUE))
+}, .id = "variable")
+transfer_by_var
+
+covariate_transfer <- map_dfr(set_names(key_vars), function(v) {
+  map_dfr(compact(map(syn_fits, v)), ~ compare_coefs(real_fits[[v]]$cov_terms, .x$cov_terms))
+}, .id = "variable") %>%
+  group_by(term) %>%
+  summarise(sign_agree = mean(sign_agree), decision_agree = mean(decision_agree),
+            ci_overlap_median = median(ci_overlap), .groups = "drop")
+covariate_transfer
+```
+
+## 5. Original vs synthetic model results (wearables)
+
+```{r emmeans-plots, fig.width = 13, fig.height = 16, message = FALSE, warning = FALSE}
+plot_means <- bind_rows(
+  imap_dfr(real_fits, ~ .x$means %>% mutate(variable = .y, source = "Original")),
+  imap_dfr(compact(syn_fits[[1]]), ~ .x$means %>% mutate(variable = .y, source = "Synthetic (seed 1)"))
+) %>%
+  mutate(variable = gsub("hrvAnalysis_|_daily", "", variable),
+         source = factor(source, levels = c("Original", "Synthetic (seed 1)")))
+
+class_cols <- c("Non_Responder" = "#C2410C", "Partial_Responder" = "#8C8C8C", "Responder" = "#1D4ED8")
+p_means <- ggplot(plot_means, aes(time_var, emmean, colour = resp_class, group = resp_class)) +
+  geom_line(linewidth = 0.8, position = position_dodge(4)) +
+  geom_errorbar(aes(ymin = lower.CL, ymax = upper.CL), width = 0, linewidth = 0.7, position = position_dodge(4)) +
+  geom_point(size = 1.8, position = position_dodge(4)) +
+  facet_grid(variable ~ source, scales = "free_y") +
+  scale_colour_manual(values = class_cols) +
+  labs(x = "Days since biologic", y = "Estimated marginal mean (95% CI)", colour = NULL) +
+  theme_minimal(base_size = 13) + theme(legend.position = "bottom", strip.text.y = element_text(angle = 0))
+ggsave(file.path(out_dir, "emmeans_original_vs_synthetic.png"), p_means, width = 12, height = 16, dpi = 200)
+p_means
+
+# Side by side: original and synthetic estimates next to each other at each timepoint, one panel per class
+side_means <- bind_rows(
+  imap_dfr(real_fits, ~ .x$means %>% mutate(variable = .y, source = "Original")),
+  imap_dfr(seeds, function(s, i) imap_dfr(compact(syn_fits[[i]]),
+                                         ~ .x$means %>% mutate(variable = .y, source = paste0("Synthetic seed ", s))))
+) %>%
+  mutate(variable = gsub("hrvAnalysis_|_daily", "", variable),
+         source = factor(source, levels = c("Original", paste0("Synthetic seed ", seeds))))
+source_cols   <- c("Original" = "#14213D", set_names(colorRampPalette(c("#E07B39", "#F2C29B"))(length(seeds)),
+                                                     paste0("Synthetic seed ", seeds)))
+source_shapes <- c("Original" = 16, set_names(rep(1, length(seeds)), paste0("Synthetic seed ", seeds)))
+walk(unique(side_means$variable), function(v) {
+  p <- ggplot(filter(side_means, variable == v), aes(time_var, emmean, colour = source, shape = source)) +
+    geom_errorbar(aes(ymin = lower.CL, ymax = upper.CL), width = 0, linewidth = 0.7,
+                  position = position_dodge(width = 10)) +
+    geom_point(size = 2.4, stroke = 1, position = position_dodge(width = 10)) +
+    facet_wrap(~ resp_class) +
+    scale_colour_manual(values = source_cols) + scale_shape_manual(values = source_shapes) +
+    scale_x_continuous(breaks = seq(0, max_days, by = 14)) +
+    labs(x = "Days since biologic", y = v, colour = NULL, shape = NULL,
+         title = paste0(v, ": estimated means (95% CI), original vs synthetic")) +
+    theme_minimal(base_size = 14) + theme(legend.position = "bottom")
+  ggsave(file.path(out_dir, paste0("sidebyside_", v, ".png")), p, width = 13, height = 5.5, dpi = 200)
+})
+
+walk(unique(plot_means$variable), function(v) {
+  p <- ggplot(filter(plot_means, variable == v), aes(time_var, emmean, colour = resp_class, group = resp_class)) +
+    geom_line(linewidth = 0.9, position = position_dodge(4)) +
+    geom_errorbar(aes(ymin = lower.CL, ymax = upper.CL), width = 0, linewidth = 0.8, position = position_dodge(4)) +
+    geom_point(size = 2.2, position = position_dodge(4)) +
+    facet_wrap(~ source) +
+    scale_colour_manual(values = class_cols) +
+    labs(x = "Days since biologic", y = v, colour = NULL) +
+    theme_minimal(base_size = 15) + theme(legend.position = "bottom")
+  ggsave(file.path(out_dir, paste0("emmeans_", v, ".png")), p, width = 11, height = 5.5, dpi = 200)
+})
+```
+
+```{r save}
+saveRDS(list(structure = bind_rows(real = structure_summary(real),
+                                   vae_median = map_dfr(vae_list, structure_summary) %>% summarise(across(everything(), median)),
+                                   .id = "data"),
+             utility_overall = utility_overall, oneway = cmp$tab.utility, twoway_summary = twoway_summary,
+             twoway_worst = twoway_worst,
+             utility_tab_by_var = utility_tab_by_var, ks_by_var = ks_by_var,
+             patient_level_overall = patient_level_overall, patient_level_by_var = patient_level_by_var,
+             replica_check = replica_check, transfer_by_var = transfer_by_var,
+             covariate_transfer = covariate_transfer, plot_means = plot_means, side_means = side_means),
+        file.path(out_dir, "validation_results.rds"))
+```
+
+## References
+
+**Synthetic-data utility**
+
+- Nowok, B., Raab, G. M., & Dibben, C. (2016). synthpop: Bespoke creation of synthetic data in R. *Journal of Statistical Software*, 74(11). https://www.jstatsoft.org/article/view/v074i11
+- Raab, G. M., Nowok, B., & Dibben, C. Assessing, visualizing and improving the utility of synthetic data. arXiv:2109.12717. (The workflow used here: `utility.gen()` with CART, `compare()`, `utility.tables()`, thresholds 3 / 10.)
+- Snoke, J., Raab, G. M., Nowok, B., Dibben, C., & Slavković, A. (2018). General and specific utility measures for synthetic data. *JRSS-A*, 181(3), 663–688. arXiv:1604.06651. (pMSE and the standardized S_pMSE.)
+- Woo, M.-J., Reiter, J. P., Oganian, A., & Karr, A. F. (2009). Global measures of data utility for microdata masked for disclosure limitation. *Journal of Privacy and Confidentiality*, 1(1). (Origin of the propensity-score utility measure.)
+- Karr, A. F., Kohnen, C. N., Oganian, A., Reiter, J. P., & Sanil, A. P. (2006). A framework for evaluating the utility of data altered to protect confidentiality. *The American Statistician*, 60(3), 224–232. (Confidence-interval overlap.)
+
+**Generator (temporal VAE)**
+
+- Kingma, D. P., & Welling, M. (2014). Auto-encoding variational Bayes. *ICLR*. arXiv:1312.6114.
+- Bowman, S. R., et al. (2016). Generating sentences from a continuous space. *CoNLL*. (LSTM VAE, posterior collapse, KL warm-up.)
+- Higgins, I., et al. (2017). β-VAE: Learning basic visual concepts with a constrained variational framework. *ICLR*. (KL weight β.)
+- Ghosh, P., Sajjadi, M. S. M., Vergari, A., Black, M., & Schölkopf, B. (2020). From variational to deterministic autoencoders. *ICLR*. arXiv:1903.12436. (Sampling from a density fitted to the encoded training data instead of the prior: `z_source = "aggregate"`.)
+- Nazábal, A., Olmos, P. M., Ghahramani, Z., & Valera, I. (2020). Handling incomplete heterogeneous data using VAEs. *Pattern Recognition*, 107, 107501. (Masking missing values in the likelihood; mixed data types.)
+- Box, G. E. P., & Cox, D. R. (1964). An analysis of transformations. *JRSS-B*, 26(2), 211–252.
+
+**Analysis model**
+
+- Pinheiro, J. C., & Bates, D. M. (2000). *Mixed-Effects Models in S and S-PLUS*. Springer. (`nlme::lme`.)
+- Lenth, R. V. emmeans: Estimated marginal means, aka least-squares means. R package. https://github.com/rvlenth/emmeans

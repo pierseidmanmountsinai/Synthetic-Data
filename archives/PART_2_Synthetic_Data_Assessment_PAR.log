@@ -1,0 +1,11 @@
+
+
+processing file: PART_2_Synthetic_Data_Assessment_PAR.Rmd
+  |                                                 |                                         |   0%  |                                                 |.                                        |   1%                               |                                                 |.                                        |   3% [libraries]                   |                                                 |..                                       |   4%                               |                                                 |..                                       |   6% [directories]                 |                                                 |...                                      |   7%                               |                                                 |....                                     |   9% [settings]                    |                                                 |....                                     |  10%                               |                                                 |.....                                    |  11% [load generator]              |                                                 |.....                                    |  13%                               |                                                 |......                                   |  14% [load PART 4 function]        |                                                 |......                                   |  16%                               |                                                 |.......                                  |  17% [load data]                   |                                                 |........                                 |  19%                               |                                                 |........                                 |  20% [generate]                  
+
+
+Quitting from PART_2_Synthetic_Data_Assessment_PAR.Rmd:121-142 [generate]
+                                                                                                                       
+Error in py_module_import(module, convert = convert) : 
+  ModuleNotFoundError: No module named 'sdv'
+Run `reticulate::py_last_error()` for details.

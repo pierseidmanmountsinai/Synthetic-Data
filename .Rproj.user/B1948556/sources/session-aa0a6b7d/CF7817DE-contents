@@ -1,0 +1,458 @@
+---
+title: "Synthetic Longitudinal Data Generation"
+author: "Mayte Suárez Farinas"
+output: html_document
+---
+
+Generate synthetic data preserving multivariate correlations via copula,
+with Box-Cox transformation and parallel processing (no for loops).
+
+```{r setup, message=FALSE, warning=FALSE}
+library(copula)
+library(tidyverse)
+library(car)  # for powerTransform (Box-Cox)
+library(furrr)  # for parallel map operations
+library(nlme)  # ADDED: for Orthodont test data
+```
+
+## Main Function: Generate Synthetic Longitudinal Data
+
+```{r main-function}
+generate_synthetic_longitudinal <- function(
+  real_data,
+  n_patients = NULL,
+  n_timepoints = NULL,
+  var_types = NULL,
+  seed = 42,
+  parallel = TRUE,
+  strata = NULL           # NEW: categorical variable; one copula is fitted per level (NULL = one copula)
+) {
+
+  #' Generate synthetic longitudinal data via Gaussian copula with Box-Cox
+  #' Parallelized, no for loops. Output on original scale.
+  #'
+  #' @param real_data Dataframe with patient_id, time, and variable columns
+  #' @param n_patients Number of patients to generate (default: unique count in real_data)
+  #' @param n_timepoints Number of timepoints per patient (default: max time in real_data)
+  #' @param var_types Named list of variable types; auto-detected if NULL
+  #' @param seed Random seed for reproducibility
+  #' @param parallel Logical; use parallel processing (default: TRUE)
+  #' @param strata Name of a categorical variable (NEW). A separate copula is fitted within each level, so each
+  #'        group keeps its own relationships. Synthetic patients are allocated to levels at the real shares.
+  #'        Missing values (NEW) are kept: NA is its own level for categorical variables; continuous variables
+  #'        get a missingness indicator in the copula, and correlations use pairwise-complete rows.
+  #'
+  #' @return Dataframe with synthetic data (fake patient IDs, original scale)
+
+  if (!is.null(seed)) set.seed(seed)
+
+  # Set up parallel backend if requested
+  if (parallel) {
+    plan(multisession)  # or use plan(multicore) on Unix/Mac
+    cat("✓ Parallel processing enabled\n")
+  }
+
+  # Infer defaults from real_data
+  if (is.null(n_patients)) {
+    n_patients <- n_distinct(real_data$patient_id)
+  }
+  if (is.null(n_timepoints)) {
+    n_timepoints <- max(real_data$time, na.rm = TRUE)
+  }
+
+  # Step 1: De-identify
+  data_deident <- real_data %>%
+    select(-patient_id) %>%
+    as_tibble()
+
+  # Step 2: Auto-detect variable types
+  if (is.null(var_types)) {
+    var_types <- auto_detect_var_types(data_deident %>% select(-time))
+    cat("Auto-detected variable types:\n")
+    iwalk(var_types, ~ cat(sprintf("  %s: %s\n", .y, .x)))
+  }
+
+  # Steps 3-9: Box-Cox, margins, copula fit, sampling, inverse transform   # CHANGED: moved into fit_sample_copula()
+  vars_data <- data_deident %>% select(-time)                                # NEW
+  if (is.null(strata)) {
+    synthetic_data <- fit_sample_copula(vars_data, var_types, n_patients * n_timepoints, parallel)
+  } else {                                                                   # NEW: one copula per stratum
+    if (!(strata %in% names(var_types)) || var_types[[strata]] != "categorical") {
+      stop("strata must be a categorical variable.")
+    }
+    if (anyNA(vars_data[[strata]])) stop("strata cannot have missing values.")
+    parts <- split(vars_data, vars_data[[strata]], drop = TRUE)
+    n_per <- as.vector(rmultinom(1, n_patients, map_int(parts, nrow)))       # patients per stratum
+    synthetic_data <- map2(parts[n_per > 0], n_per[n_per > 0],
+                           ~ fit_sample_copula(.x, var_types, .y * n_timepoints, parallel)) %>%
+      bind_rows()
+    cat("Patients per stratum:", paste(names(parts), n_per, sep = " = ", collapse = ", "), "\n")
+  }
+  cat("✓ Copula fitted and sampled\n")
+
+  # Step 10: Add fake patient IDs and time structure
+  synthetic_data <- synthetic_data %>%
+    mutate(
+      patient_id = rep(sample(10000:99999, n_patients, replace = FALSE), each = n_timepoints),
+      time = rep(1:n_timepoints, n_patients)
+    ) %>%
+    select(patient_id, time, everything())
+
+  cat(sprintf("✓ Generated %d patients × %d timepoints = %d rows (original scale)\n",
+              n_patients, n_timepoints, nrow(synthetic_data)))
+
+  return(synthetic_data)
+}
+```
+
+## Helper Function - Fit and Sample One Copula (NEW)
+
+```{r helpers-fit-sample}
+fit_sample_copula <- function(data, var_types, n_rows, parallel = TRUE) {   # NEW: former Steps 3-9
+  #' Fit the copula to one data set (or one stratum) and draw n_rows synthetic rows on the original scale.
+  #' Variables with one value in this data (e.g. the stratum variable) are kept constant, not in the copula.
+  #' Continuous variables with NA get a missingness indicator (.na_<var>) that enters the copula.
+  na_vars <- names(data)[map_lgl(names(data), ~ var_types[[.x]] == "continuous" && anyNA(data[[.x]]))]
+  data_in <- data                                                          # original columns, for the output
+  data <- data %>% mutate(across(all_of(na_vars), ~ factor(is.na(.x), c(FALSE, TRUE)), .names = ".na_{.col}"))
+  var_types <- c(var_types, set_names(rep(list("categorical"), length(na_vars)), paste0(".na_", na_vars)))
+  constant <- names(data)[map_lgl(data, ~ n_distinct(.x) < 2)]
+  types <- var_types[setdiff(names(data), constant)]
+  data_vars <- data %>% select(all_of(names(types)))
+
+  boxcox_params <- fit_boxcox_parallel(data_vars, types, parallel)
+  data_boxcox   <- apply_boxcox_parallel(data_vars, boxcox_params, types, parallel)
+  marginals     <- fit_marginals(data_boxcox, types)
+  data_uniform  <- transform_to_uniform(data_boxcox, marginals, types)
+
+  synthetic_uniform <- if (ncol(data_uniform) > 1) {
+    # Inversion of Kendall's tau (as fitCopula(method = "itau")), on pairwise-complete rows so NA is allowed
+    tau <- cor(as.matrix(data_uniform), method = "kendall", use = "pairwise.complete.obs")
+    rho <- as.matrix(Matrix::nearPD(sin(pi * tau / 2), corr = TRUE)$mat)   # nearest valid correlation matrix
+    rCopula(n_rows, normalCopula(P2p(rho), dim = ncol(rho), dispstr = "un"))
+  } else {
+    matrix(runif(n_rows), ncol = 1)
+  }
+  colnames(synthetic_uniform) <- colnames(data_uniform)
+
+  synthetic <- inverse_transform_parallel(as_tibble(synthetic_uniform), marginals, boxcox_params, types, parallel)
+  if (length(constant) > 0) {
+    synthetic <- bind_cols(synthetic, map_dfc(set_names(constant), ~ rep(data[[.x]][1], n_rows)))
+  }
+  synthetic %>%
+    mutate(across(all_of(na_vars), ~ if_else(synthetic[[paste0(".na_", cur_column())]] == "TRUE", NA_real_, .x))) %>%
+    select(all_of(names(data_in)))
+}
+```
+
+## Helper Functions - Auto-detect and Marginals
+
+```{r helpers-marginals}
+auto_detect_var_types <- function(data) {
+  #' Auto-detect continuous vs. categorical variables
+  map(data, function(x) {
+    if (is.numeric(x)) "continuous"
+    else if (is.character(x) || is.factor(x)) "categorical"
+    else "other"
+  })
+}
+
+fit_marginals <- function(data, var_types) {
+  #' Fit marginal distributions for each variable
+  map2(names(var_types), var_types, function(var, type) {
+    if (type == "continuous") {
+      vals <- data[[var]]
+      list(type = "continuous", mean = mean(vals, na.rm = TRUE), sd = sd(vals, na.rm = TRUE),  # CHANGED: na.rm
+           values = sort(vals))                                  # NEW: observed values (empirical margin)
+    } else if (type == "categorical") {
+      unique_vals <- sort(unique(data[[var]]))
+      if (anyNA(data[[var]])) unique_vals <- unique_vals[c(seq_along(unique_vals), NA)]  # NEW: NA is its own level
+      probs <- tabulate(match(data[[var]], unique_vals), length(unique_vals)) / length(data[[var]])  # NEW
+      list(type = "categorical", levels = unique_vals, n_levels = length(unique_vals),
+           cum_probs = cumsum(probs))                                        # NEW: bin edges by level share
+    }
+  }) %>%
+    set_names(names(var_types))   # CHANGED: added so marginals[[var]] works
+}
+```
+
+## Helper Functions - Box-Cox (Parallel)
+
+```{r helpers-boxcox}
+fit_boxcox_parallel <- function(data, var_types, parallel = TRUE) {
+  #' Fit Box-Cox transformations for continuous variables (parallel)
+
+  continuous_vars <- names(var_types[var_types == "continuous"])
+
+  # Parallel or sequential map
+  map_fn <- if (parallel) future_map else map
+
+  boxcox_list <- map_fn(continuous_vars, function(var) {
+    fit_boxcox_single(data[[var]], var)
+  })
+
+  names(boxcox_list) <- continuous_vars
+
+  # Add NA entries for categorical variables
+  full_params <- map(names(var_types), function(var) {
+    if (var %in% continuous_vars) {
+      boxcox_list[[var]]
+    } else {
+      list(lambda = NA, shift = 0, fitted = NA)
+    }
+  })
+  names(full_params) <- names(var_types)
+
+  return(full_params)
+}
+
+fit_boxcox_single <- function(vals, var_name) {
+  #' Fit Box-Cox for a single continuous variable
+
+  vals <- vals[!is.na(vals)]   # NEW: fit on observed values
+
+  tryCatch({
+    # Shift if zero or negative
+    if (any(vals <= 0)) {
+      shift <- abs(min(vals)) + 1
+      vals <- vals + shift
+    } else {
+      shift <- 0
+    }
+
+    # Fit power transformation
+    pt <- powerTransform(vals)
+    lambda <- pt$lambda
+
+    list(lambda = lambda, shift = shift, fitted = TRUE)
+  }, error = function(e) {
+    cat(sprintf("  Warning: Box-Cox failed for %s, using identity\n", var_name))
+    list(lambda = 1, shift = 0, fitted = FALSE)
+  })
+}
+
+apply_boxcox_parallel <- function(data, boxcox_params, var_types, parallel = TRUE) {
+  #' Apply Box-Cox transformations (parallel)
+
+  continuous_vars <- names(var_types[var_types == "continuous"])
+
+  # Parallel or sequential map
+  map_fn <- if (parallel) future_map else map
+
+  transformed_vars <- map_fn(continuous_vars, function(var) {
+    boxcox_transform_single(data[[var]], boxcox_params[[var]])
+  })
+  names(transformed_vars) <- continuous_vars
+
+  # Rebuild dataframe with transformed continuous vars and original categorical/time
+  result <- data %>%
+    select(-all_of(continuous_vars))
+
+  map2(continuous_vars, transformed_vars, function(var, vals) {
+    result[[var]] <<- vals
+  })
+
+  # Reorder to original column order
+  result <- result %>% select(all_of(names(data)))
+
+  return(result)
+}
+
+boxcox_transform_single <- function(vals, boxcox_param) {
+  #' Apply Box-Cox transformation to a single variable
+
+  lambda <- boxcox_param$lambda
+  shift <- boxcox_param$shift
+
+  vals_shifted <- vals + shift
+
+  if (abs(lambda) < 1e-6) {
+    log(vals_shifted)
+  } else {
+    (vals_shifted^lambda - 1) / lambda
+  }
+}
+```
+
+## Helper Functions - Inverse Transform (Parallel)
+
+```{r helpers-inverse}
+inverse_transform_parallel <- function(data, marginals, boxcox_params, var_types, parallel = TRUE) {
+  #' Inverse transform: uniform → normal → Box-Cox inverse → original scale (parallel)
+
+  continuous_vars <- names(var_types[var_types == "continuous"])
+  categorical_vars <- names(var_types[var_types == "categorical"])
+
+  # Parallel or sequential map
+  map_fn <- if (parallel) future_map else map
+
+  # Transform continuous variables (parallel)
+  if (length(continuous_vars) > 0) {
+    transformed_cont <- map_fn(continuous_vars, function(var) {
+      uniform_val <- data[[var]]
+
+      # Uniform → observed quantiles   # CHANGED: was qnorm(u) * sd + mean (gave NaN after inverse Box-Cox)
+      normal_val <- quantile(marginals[[var]]$values, uniform_val, type = 8, names = FALSE)
+
+      # Box-Cox inverse
+      inverse_boxcox_single(normal_val, boxcox_params[[var]])
+    })
+    names(transformed_cont) <- continuous_vars
+  }
+
+  # Transform categorical variables (sequential, already fast)
+  if (length(categorical_vars) > 0) {
+    transformed_cat <- map(categorical_vars, function(var) {
+      uniform_val <- data[[var]]
+      unique_vals <- marginals[[var]]$levels
+      cum_probs <- marginals[[var]]$cum_probs                                # CHANGED: bins sized by level share
+      unique_vals[findInterval(uniform_val, head(cum_probs, -1)) + 1]        # CHANGED: was floor(u * n_levels)
+    })
+    names(transformed_cat) <- categorical_vars
+  }
+
+  # Rebuild dataframe
+  result <- data %>% select(ends_with("_unused"))  # Start empty
+  result <- tibble(.rows = nrow(data))   # CHANGED: was tibble(); 0-row tibble cannot bind to n rows
+
+  if (length(continuous_vars) > 0) {
+    result <- bind_cols(result, as_tibble(transformed_cont))
+  }
+  if (length(categorical_vars) > 0) {
+    result <- bind_cols(result, as_tibble(transformed_cat))
+  }
+
+  return(result)
+}
+
+inverse_boxcox_single <- function(y, boxcox_param) {
+  #' Inverse Box-Cox transformation for a single variable
+
+  lambda <- boxcox_param$lambda
+  shift <- boxcox_param$shift
+
+  if (abs(lambda) < 1e-6) {
+    x <- exp(y)
+  } else {
+    x <- (lambda * y + 1)^(1 / lambda)
+  }
+
+  x - shift
+}
+```
+
+## Helper Function - Transform to Uniform
+
+```{r helpers-uniform}
+transform_to_uniform <- function(data, marginals, var_types) {
+  #' Transform data to uniform [0,1] scale for copula fitting
+
+  continuous_vars <- names(var_types[var_types == "continuous"])
+  categorical_vars <- names(var_types[var_types == "categorical"])
+
+  # Transform continuous variables
+  if (length(continuous_vars) > 0) {
+    data_cont <- map_dfc(continuous_vars, function(var) {   # CHANGED: map_df -> map_dfc
+      x <- data[[var]]
+      uniform_val <- (rank(x, na.last = "keep") - 0.5) / sum(!is.na(x))      # CHANGED: ranks (was pnorm of z-score); NA stays NA
+      tibble(!!var := uniform_val)
+    })
+  }
+
+  # Transform categorical variables
+  if (length(categorical_vars) > 0) {
+    data_cat <- map_dfc(categorical_vars, function(var) {   # CHANGED: map_df -> map_dfc
+      unique_vals <- marginals[[var]]$levels
+      codes <- match(data[[var]], unique_vals)                               # CHANGED: bins sized by level share
+      upper <- marginals[[var]]$cum_probs[codes]
+      lower <- c(0, marginals[[var]]$cum_probs)[codes]
+      uniform_val <- lower + runif(length(codes)) * (upper - lower)          # CHANGED: was (code + U) / n_levels
+      tibble(!!var := uniform_val)
+    })
+  }
+
+  # Combine and return
+  if (length(continuous_vars) > 0 && length(categorical_vars) > 0) {
+    bind_cols(data_cont, data_cat)
+  } else if (length(continuous_vars) > 0) {
+    data_cont
+  } else {
+    data_cat
+  }
+}
+```
+
+## Example Usage
+
+```{r example-usage}
+if (FALSE) {  # Set to TRUE to run
+
+  # Example: Generate synthetic data with parallelization
+  synthetic <- generate_synthetic_longitudinal(
+    real_data = my_real_data,
+    n_patients = 100,
+    n_timepoints = 5,
+    seed = 42,
+    parallel = TRUE  # Use parallel processing
+  )
+
+  # Output is on ORIGINAL SCALE for outlier detection
+  # Identify outliers, etc.
+  synthetic %>%
+    group_by(time) %>%
+    summarise(
+      across(where(is.numeric), list(mean = mean, sd = sd, min = min, max = max))
+    )
+
+  write_csv(synthetic, "synthetic_data.csv")
+}
+```
+
+## Test Run (ADDED)
+
+Test data: `nlme::Orthodont` (27 patients × 4 timepoints).
+Recoded: `Subject` → `patient_id`, `age` (8/10/12/14) → `time` (1–4).
+`age` is dropped because it is now `time`. Variables kept: `distance` (continuous), `Sex` (categorical).
+
+```{r test-data}
+test_data <- as_tibble(Orthodont) %>%
+  mutate(
+    patient_id = as.character(Subject),
+    time = as.integer((age - 8) / 2 + 1)
+  ) %>%
+  select(patient_id, time, distance, Sex)
+
+head(test_data)
+```
+
+```{r test-run}
+synthetic <- generate_synthetic_longitudinal(
+  real_data = test_data,
+  seed = 42,
+  parallel = FALSE  # sequential for the first test
+)
+
+head(synthetic)
+dim(synthetic)
+colSums(is.na(synthetic))  # check for NaN/NA from inverse Box-Cox
+```
+
+```{r test-compare}
+compare <- bind_rows(
+  real = test_data %>% select(-patient_id),
+  synthetic = synthetic %>% select(-patient_id),
+  .id = "source"
+)
+
+# Marginal: distance
+compare %>%
+  group_by(source) %>%
+  summarise(mean = mean(distance), sd = sd(distance),
+            min = min(distance), max = max(distance))
+
+# Marginal: Sex
+compare %>% count(source, Sex) %>% group_by(source) %>% mutate(prop = n / sum(n))
+
+# Dependence: distance by Sex
+compare %>% group_by(source, Sex) %>% summarise(mean_distance = mean(distance), .groups = "drop")
+```

@@ -1,0 +1,634 @@
+---
+title: "PART 2 - Synthetic Data Assessment (daily Corsano data) — Sequential VAE"
+author: "Piers Seidman"
+date: "2026-11-11"
+output: html_document
+---
+
+Generates one synthetic version of the daily Corsano data with the PART 1 generator, then assesses it.
+Each section asks one question about the synthetic data, in this order:
+
+1. Real data
+2. Generate synthetic data
+3. Days and missing values: are the wear pattern and the gaps the same?
+4. Patient traits: same mix of response class / sex / age / BMI, without copying real patients?
+5. Distributions: does each variable look the same on its own?
+6. Correlations: do the wearable variables move together the same way?
+7. Trajectories: same change over time?
+8. Within-patient structure: same patient-to-patient spread, slopes and day-to-day correlation?
+9. Model transfer: do the PART 4 models (`Model4WearablesV2_DailyMeans()`) give the same answer?
+10. Overall utility and privacy
+11. Summary
+
+
+```{r libraries, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+library(reticulate)
+py_require(python_version = "3.12")   # must run before keras3 on Windows
+
+# Generator (PART 1)
+library(keras3)        # Temporal VAE
+library(tidyverse)     # dplyr, tidyr, purrr, ggplot2 (the generator needs all of them)
+library(car)           # Box-Cox
+library(lme4)          # noise structure inside the generator
+
+# Models (PART 4 function)
+library(nlme)          # Linear mixed-effects models
+library(splines)       # Natural cubic splines ns()
+library(emmeans)       # Marginal means & contrasts
+library(weights)       # starmaker() inside the PART 4 function
+library(performance)   # check_model() inside the PART 4 function
+library(openxlsx)      # Excel output inside the PART 4 function
+
+# Utility
+library(synthpop)      # synthetic traits (generator) + utility.gen() S_pMSE
+
+# Visualization
+library(patchwork)     # Combine plots
+```
+
+
+```{r directories}
+main.dir    <- "C:/Users/seidmp03/OneDrive - The Mount Sinai Hospital/Synthetic Data"
+seq.dir     <- file.path(main.dir, "Claude outputs")                                     # SEQ: folder holding the 3 Sequential VAE files
+data_file   <- "H:/WearableBiologicsJJ/Data_for_Analysis/Daily_Final_DB_With_Response_Class.rda"   # real data
+part1_file  <- file.path(seq.dir, "PART_1_Sequential_VAE_Generator.Rmd")                # SEQ: generator code
+part4_rmd   <- "H:/WearableBiologicsJJ/Code/PART_4_Daily_Spline_Models.Rmd"             # Model4WearablesV2_DailyMeans()
+results.dir <- file.path(seq.dir, "PART_2_Synthetic_Assessment")                        # SEQ: outputs of this file
+dir.create(results.dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+
+```{r settings}
+seed_to_assess <- 1   # generator seed
+
+syn_file <- file.path(results.dir, paste0("corsano_synthetic_seed_", seed_to_assess, ".rds"))   # saved synthetic data
+
+key_vars <- c("Core_Body_Temperature_daily", "Skin_Contact_Temperature_daily", "respiration_daily",
+              "hrvAnalysis_sdnn_daily", "hrvAnalysis_rmssd_daily", "hrvAnalysis_min_hr_daily", "hrvAnalysis_mean_hr_daily")
+covs     <- c("age_at_enrollment", "sex_birth", "bmi", "on_any_steroid")   # PART 4 covariates
+traits   <- c("resp_class_final", "sex_birth", "age_at_enrollment", "bmi")  # constant within patient
+max_days <- 98                                                               # same as PART 4
+```
+
+
+```{r load generator}
+# Load the generator functions from PART 1 (the 3 generator chunks)
+rmd <- readLines(part1_file)
+
+# pull the code of one chunk by its label
+chunk_code <- function(label) {
+  start <- grep(paste0("^```\\{r ", label), rmd)   # line where the chunk opens
+  end   <- grep("^```\\s*$", rmd)                  # all lines that close a chunk
+  end   <- end[end > start][1]                     # first close after the open
+  rmd[(start + 1):(end - 1)]                       # code between them
+}
+
+# run the 3 generator chunks
+walk(c("generator-main", "generator-model", "generator-helpers"),
+     ~ eval(parse(text = chunk_code(.x)), envir = globalenv()))
+```
+
+
+```{r load PART 4 function}
+# Load Model4WearablesV2_DailyMeans() from the PART 4 Rmd ("Updated Function" chunk), unchanged
+part4    <- readLines(part4_rmd)
+fn_start <- grep("^```\\{r Updated Function", part4)   # line where the chunk opens
+fn_end   <- grep("^```\\s*$", part4)                   # all lines that close a chunk
+fn_end   <- fn_end[fn_end > fn_start][1]               # first close after the open
+eval(parse(text = part4[(fn_start + 1):(fn_end - 1)]))
+```
+
+
+## 1. Real data
+
+```{r load data}
+load(data_file)
+
+corsano_real <- Daily_Corsano_DB_ADJ_Response %>%
+  select(participant_id, Days_since_bio, all_of(key_vars), all_of(covs), resp_class_final)
+
+cat("Real data:", n_distinct(corsano_real$participant_id), "patients,", nrow(corsano_real), "patient-days\n")
+```
+
+
+## 2. Generate synthetic data
+
+Generated once and saved; later knits read the saved file. Delete the file (or change `seed_to_assess`) to generate
+again.
+**DATA CHANGES (generator input only):** `participant_id` is passed as `patient_id`; `sex_birth` and `on_any_steroid`
+are passed as factors (categorical). Both are converted back after generating.
+
+```{r generate}
+# ---- Real data in the form the generator expects ----
+for_generator <- corsano_real %>%
+  rename(patient_id = participant_id) %>%           # generator needs patient_id
+  mutate(sex_birth = factor(sex_birth),              # categorical
+         on_any_steroid = factor(on_any_steroid))    # categorical
+
+# ---- Generate ----   # CHANGED: always generates (no longer reads a saved file)
+corsano_syn <- generate_synthetic_temporal_vae(for_generator,
+                                               seed = seed_to_assess,
+                                               verbose = 0,
+                                               time_var = "Days_since_bio")
+
+# ---- Back to original names / types ----
+corsano_syn <- corsano_syn %>%
+  rename(participant_id = patient_id) %>%
+  mutate(participant_id = as.character(participant_id),
+         sex_birth = as.character(sex_birth),
+         on_any_steroid = as.numeric(as.character(on_any_steroid)))
+
+saveRDS(corsano_syn, syn_file)   # saved for reference only; never read back
+
+cat("Synthetic data (seed", seed_to_assess, "):", n_distinct(corsano_syn$participant_id), "patients,",
+    nrow(corsano_syn), "patient-days\n")
+```
+
+
+## 3. Days and missing values
+
+```{r day summary}
+# patients, patient-days, days per patient, last day
+day_summary <- both %>%
+  group_by(source) %>%
+  summarise(patients = n_distinct(participant_id),
+            patient_days = n(),
+            days_per_patient_median = median(table(participant_id)),
+            last_day_median = median(tapply(Days_since_bio, participant_id, max)),
+            .groups = "drop")
+print(day_summary)
+```
+
+```{r missing summary}
+# % missing per variable
+missing_summary <- both %>%
+  group_by(source) %>%
+  summarise(across(all_of(c(key_vars, "on_any_steroid")), ~ round(100 * mean(is.na(.x)), 1)),
+            .groups = "drop") %>%
+  pivot_longer(-source, names_to = "variable", values_to = "pct_missing") %>%   # one row per source and variable
+  pivot_wider(names_from = source, values_from = pct_missing)                  # Real and Synthetic side by side
+print(missing_summary)
+```
+
+```{r days plot}
+p_days <- both %>%
+  count(source, participant_id) %>%                      # days per patient
+  ggplot(aes(x = n, fill = source)) +
+  geom_histogram(binwidth = 5, position = "dodge") +
+  xlab("Days per patient") +
+  ylab("Patients") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+p_days
+```
+
+
+## 4. Patient traits
+
+Traits are made by synthpop in the generator, so a synthetic patient should not be a copy of a real one.
+
+```{r traits}
+# one row per patient
+real_traits <- both %>% filter(source == "Real")      %>% distinct(participant_id, across(all_of(traits)))
+syn_traits  <- both %>% filter(source == "Synthetic") %>% distinct(participant_id, across(all_of(traits)))
+both_traits <- bind_rows(Real = real_traits, Synthetic = syn_traits, .id = "source")
+```
+
+```{r trait mix}
+# % of patients in each response class x sex group
+trait_mix <- both_traits %>%
+  count(source, resp_class_final, sex_birth) %>%
+  group_by(source) %>%
+  mutate(pct = round(100 * n / sum(n), 1)) %>%
+  ungroup() %>%
+  select(-n) %>%
+  pivot_wider(names_from = source, values_from = pct)
+print(trait_mix)
+
+# age and BMI distribution
+age_bmi_summary <- both_traits %>%
+  pivot_longer(c(age_at_enrollment, bmi), names_to = "variable") %>%
+  group_by(variable, source) %>%
+  summarise(mean = mean(value, na.rm = TRUE),
+            sd = sd(value, na.rm = TRUE),
+            min = min(value, na.rm = TRUE),
+            median = median(value, na.rm = TRUE),
+            max = max(value, na.rm = TRUE),
+            .groups = "drop")
+print(age_bmi_summary)
+```
+
+```{r trait copies}
+# ---- Exact copies of a real patient's traits ----
+trait_key   <- function(d) paste(d$resp_class_final, d$sex_birth, d$age_at_enrollment, d$bmi)
+exact_match <- mean(trait_key(syn_traits) %in% trait_key(real_traits))
+
+# ---- Age and BMI gap to the nearest real patient with the same class and sex ----
+nearest_gap <- map_dfr(seq_len(nrow(syn_traits)), function(i) {
+  same <- real_traits %>%
+    filter(resp_class_final == syn_traits$resp_class_final[i],
+           sex_birth == syn_traits$sex_birth[i])                               # real patients in the same group
+  tibble(age_gap = min(abs(same$age_at_enrollment - syn_traits$age_at_enrollment[i])),
+         bmi_gap = min(abs(same$bmi - syn_traits$bmi[i])))
+})
+
+cat("Synthetic patients with the exact traits of a real patient:", round(100 * exact_match, 1), "%\n")
+cat("Age gap to the nearest real patient of the same class and sex (years): median",
+    round(median(nearest_gap$age_gap), 2), "; min", round(min(nearest_gap$age_gap), 3), "\n")
+cat("BMI gap to the nearest real patient of the same class and sex: median",
+    round(median(nearest_gap$bmi_gap), 2), "; min", round(min(nearest_gap$bmi_gap), 3), "\n")
+```
+
+
+## 5. Distributions
+
+```{r variable summary}
+# summary of each wearable variable, real vs synthetic
+var_summary <- both %>%
+  pivot_longer(all_of(key_vars), names_to = "variable") %>%   # long: one row per patient-day and variable
+  filter(!is.na(value)) %>%
+  group_by(variable, source) %>%
+  summarise(mean = mean(value),
+            sd = sd(value),
+            q25 = quantile(value, 0.25),
+            median = median(value),
+            q75 = quantile(value, 0.75),
+            min = min(value),
+            max = max(value),
+            .groups = "drop")
+print(as.data.frame(var_summary), digits = 3)
+```
+
+```{r densities, fig.width = 12, fig.height = 7}
+p_dens <- both %>%
+  pivot_longer(all_of(key_vars), names_to = "variable") %>%
+  filter(!is.na(value)) %>%
+  mutate(variable = gsub("hrvAnalysis_|_daily", "", variable)) %>%   # short names for the panels
+  ggplot(aes(x = value, colour = source)) +
+  geom_density(linewidth = 0.8) +
+  facet_wrap(~ variable, scales = "free") +
+  xlab("Value") +
+  ylab("Density") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+p_dens
+```
+
+```{r steroid summary}
+# % of patient-days on steroids
+steroid_summary <- both %>%
+  group_by(source) %>%
+  summarise(pct_days_on_steroid = round(100 * mean(on_any_steroid, na.rm = TRUE), 1),
+            .groups = "drop")
+print(steroid_summary)
+```
+
+
+## 6. Correlations
+
+```{r correlations}
+# Spearman correlations between wearable variables
+cor_real <- cor(corsano_real[key_vars], method = "spearman", use = "pairwise.complete.obs")
+cor_syn  <- cor(corsano_syn[key_vars],  method = "spearman", use = "pairwise.complete.obs")
+cor_diff <- cor_syn - cor_real
+
+cat("Largest correlation difference (synthetic - real):", round(max(abs(cor_diff)), 2), "\n")
+```
+
+```{r correlation plot, fig.width = 16, fig.height = 5}
+# heatmap of one correlation matrix
+cor_plot <- function(m, title) {
+  dimnames(m) <- map(dimnames(m), ~ gsub("hrvAnalysis_|_daily", "", .x))   # short names
+  as.data.frame(as.table(m)) %>%                                          # matrix -> long table (Var1, Var2, Freq)
+    ggplot(aes(Var1, Var2, fill = Freq)) +
+    geom_tile() +
+    geom_text(aes(label = round(Freq, 2)), size = 3) +
+    scale_fill_gradient2(low = "blue", mid = "white", high = "red", limits = c(-1, 1)) +
+    labs(title = title, x = NULL, y = NULL, fill = "Spearman") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+}
+
+cor_plot(cor_real, "Real") + cor_plot(cor_syn, "Synthetic") + cor_plot(cor_diff, "Synthetic - Real")
+```
+
+
+## 7. Trajectories
+
+```{r trajectories, fig.width = 12, fig.height = 7}
+# Median and IQR of each variable on each day (days with at least 10 patients)
+p_traj <- both %>%
+  pivot_longer(all_of(key_vars), names_to = "variable") %>%
+  filter(!is.na(value)) %>%
+  mutate(variable = gsub("hrvAnalysis_|_daily", "", variable)) %>%
+  group_by(source, variable, Days_since_bio) %>%
+  summarise(n = n(),
+            median = median(value),
+            q25 = quantile(value, 0.25),
+            q75 = quantile(value, 0.75),
+            .groups = "drop") %>%
+  filter(n >= 10) %>%                                                      # drop sparse days
+  ggplot(aes(x = Days_since_bio, y = median, colour = source, fill = source)) +
+  geom_ribbon(aes(ymin = q25, ymax = q75), alpha = 0.15, colour = NA) +
+  geom_line(linewidth = 0.6) +
+  facet_wrap(~ variable, scales = "free_y") +
+  xlab("Days since biologic start") +
+  ylab("Median (IQR)") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+p_traj
+```
+
+```{r spaghetti, fig.width = 10}
+# Mean HR for 12 random patients from each source
+set.seed(1)
+spaghetti_ids <- both %>%
+  distinct(source, participant_id) %>%
+  group_by(source) %>%
+  filter(participant_id %in% sample(unique(participant_id), 12)) %>%   # 12 patients per source
+  ungroup()
+
+p_spag <- both %>%
+  semi_join(spaghetti_ids, by = c("source", "participant_id")) %>%
+  ggplot(aes(x = Days_since_bio, y = hrvAnalysis_mean_hr_daily, group = participant_id)) +
+  geom_line(alpha = 0.6) +
+  facet_wrap(~ source) +
+  xlab("Days since biologic start") +
+  ylab("Mean HR (daily)") +
+  theme_minimal()
+p_spag
+```
+
+
+## 8. Within-patient structure
+
+For each variable: `lme(y ~ weeks, random = ~ weeks | participant_id)` on real and synthetic data (time in weeks so
+the slope SD is per week). sd_intercept / sd_slope = how much patients differ in level / in change over time;
+sd_resid = day-to-day noise; lag1_cor = correlation of a patient's residuals on consecutive rows.
+
+```{r variance components}
+# var components for one variable
+var_components <- function(db, var) {
+  d <- db %>%
+    mutate(y = .data[[var]],
+           weeks = Days_since_bio / 7) %>%        # time in weeks
+    filter(!is.na(y)) %>%
+    arrange(participant_id, Days_since_bio)
+
+  # random intercept + slope model
+  f <- tryCatch(lme(y ~ weeks, random = ~ weeks | participant_id, data = d, method = "ML",
+                    control = lmeControl(opt = "optim")),
+                error = function(e) NULL)
+  if (is.null(f)) return(tibble(variable = var))
+
+  sds <- as.numeric(VarCorr(f)[, "StdDev"])   # sd as numeric: intercept, slope, residual
+
+  # residual and the same patient's residual on the previous row
+  r <- d %>%
+    mutate(e = resid(f)) %>%
+    group_by(participant_id) %>%
+    mutate(e_prev = lag(e)) %>%
+    ungroup()
+
+  tibble(variable = var,
+         sd_intercept = sds[1],
+         sd_slope = sds[2],
+         sd_resid = sds[3],
+         lag1_cor = cor(r$e, r$e_prev, use = "complete.obs"))
+}
+
+# all variables, real and synthetic
+vc_table <- map_dfr(key_vars, function(v) {
+  bind_rows(Real = var_components(corsano_real, v),
+            Synthetic = var_components(corsano_syn, v),
+            .id = "source")
+})
+print(as.data.frame(vc_table), digits = 3)
+```
+
+```{r steroid switches}
+# times a patient's steroid status changes between consecutive days
+steroid_switches <- both %>%
+  arrange(source, participant_id, Days_since_bio) %>%
+  filter(!is.na(on_any_steroid)) %>%
+  group_by(source, participant_id) %>%
+  summarise(n_switch = sum(on_any_steroid != lag(on_any_steroid), na.rm = TRUE),
+            .groups = "drop") %>%
+  group_by(source) %>%
+  summarise(mean_switches = mean(n_switch),
+            pct_never_switch = round(100 * mean(n_switch == 0), 1),
+            max_switches = max(n_switch),
+            .groups = "drop")
+print(steroid_switches)
+```
+
+
+## 9. Model transfer
+
+The question that matters: would an analyst reach the same conclusions from the synthetic data?
+`Model4WearablesV2_DailyMeans()` from PART 4 is run unchanged on the real and the synthetic data (same call as PART 4).
+Each run writes its usual Excel file, plots and GOF plots to its own folder under `Corsano_Models/`.
+
+```{r run PART 4 models, results = "hide", fig.show = "hide"}
+# run the PART 4 function on one dataset, in its own folder
+run_part4 <- function(d, label) {
+  res_dir <- file.path(results.dir, "Corsano_Models", label)
+  dir.create(res_dir, recursive = TRUE, showWarnings = FALSE)
+  res <- Model4WearablesV2_DailyMeans(db = d, vars2run = key_vars, time_column = "Days_since_bio",
+                                      resp_class = "resp_class_final", covs = covs,
+                                      max_days = max_days, results.dir = res_dir)
+  graphics.off()                                       # close devices left open if check_model() fails
+  res$results %>%
+    compact() %>%                                      # drop variables that failed
+    set_names(map_chr(., "variable"))
+}
+
+# real data: PART 4 models fitted once and saved; later runs read the saved fits   # CHANGED
+real_file <- file.path(results.dir, "Corsano_Models", "real_fits.rds")
+if (!file.exists(real_file)) saveRDS(run_part4(corsano_real, "Original"), real_file)
+real_fits <- readRDS(real_file)
+syn_fits  <- run_part4(corsano_syn, paste0("Synthetic_seed_", seed_to_assess))
+```
+
+```{r compare helpers}
+# share of each CI covered by the other, averaged (1 = identical CIs)
+ci_overlap <- function(l1, u1, l2, u2) {
+  ov <- pmax(0, pmin(u1, u2) - pmax(l1, l2))
+  (ov / (u1 - l1) + ov / (u2 - l2)) / 2
+}
+
+# knots of the model BIC picked
+best_knots <- function(x) {
+  as.integer(gsub("knots", "", x$model_comparison$Model[which.min(x$model_comparison$BIC)]))
+}
+```
+
+```{r transfer by variable}
+# per variable: same knots? same estimated means? same significance calls?
+transfer_by_var <- map_dfr(key_vars, function(v) {
+  r <- real_fits[[v]]
+  s <- syn_fits[[v]]
+  if (is.null(r) || is.null(s)) return(tibble(variable = v))
+
+  # bi-weekly estimated means by class
+  m <- inner_join(r$results, s$results, by = c("time_var", "resp_class"), suffix = c("_r", "_s"))
+
+  # Non-Responder - Responder contrasts
+  b <- inner_join(r$between, s$between, by = c("time_var", "contrast"), suffix = c("_r", "_s"))
+
+  # within-class change from day 0
+  w <- m %>% filter(!is.na(p_within_r), !is.na(p_within_s))
+
+  tibble(variable = v,
+         knots_real = best_knots(r),
+         knots_syn = best_knots(s),
+         emmean_ci_overlap = median(ci_overlap(m$lower.CL_r, m$upper.CL_r, m$lower.CL_s, m$upper.CL_s)),
+         between_decision_agree = mean((b$p_between_r < 0.05) == (b$p_between_s < 0.05)),
+         within_decision_agree = mean((w$p_within_r < 0.05) == (w$p_within_s < 0.05)))
+})
+print(as.data.frame(transfer_by_var), digits = 3)
+```
+
+```{r covariate effects}
+# covariate coefficients (age, sex, BMI, steroid), real vs synthetic, per variable
+cov_terms <- function(x) {
+  tibble(term = names(fixef(x$model)),
+         est = unname(fixef(x$model)),
+         se = unname(sqrt(diag(vcov(x$model))))) %>%
+    filter(!grepl("resp_class|time_var|Intercept", term))   # covariates only
+}
+
+covariate_compare <- map_dfr(key_vars, function(v) {
+  if (is.null(real_fits[[v]]) || is.null(syn_fits[[v]])) return(tibble())
+  inner_join(cov_terms(real_fits[[v]]), cov_terms(syn_fits[[v]]), by = "term", suffix = c("_real", "_syn")) %>%
+    mutate(variable = v,
+           p_real = 2 * pnorm(-abs(est_real / se_real)),
+           p_syn  = 2 * pnorm(-abs(est_syn / se_syn)),
+           same_sign = sign(est_real) == sign(est_syn),
+           same_decision = (p_real < 0.05) == (p_syn < 0.05),
+           ci_overlap = ci_overlap(est_real - 1.96 * se_real, est_real + 1.96 * se_real,
+                                   est_syn - 1.96 * se_syn,   est_syn + 1.96 * se_syn))
+})
+print(as.data.frame(covariate_compare %>% select(variable, term, est_real, est_syn, p_real, p_syn,
+                                                 same_sign, same_decision, ci_overlap)), digits = 3)
+```
+
+PART 4 plots, real (left) and synthetic (right), one row per variable:
+
+```{r PART 4 plots, out.width = "49%", fig.show = "hold"}
+plot_files <- map(key_vars, function(v) {
+  c(file.path(results.dir, "Corsano_Models", "Original", "Plots", paste0("Plot_", v, ".png")),
+    file.path(results.dir, "Corsano_Models", paste0("Synthetic_seed_", seed_to_assess), "Plots",
+              paste0("Plot_", v, ".png")))
+}) %>%
+  unlist()
+knitr::include_graphics(plot_files[file.exists(plot_files)])
+```
+
+
+## 10. Overall utility and privacy
+
+S_pMSE: a CART model tries to tell real rows from synthetic rows (synthpop). 1 = as good as chance; under 10 is usually
+called good.
+Distance to closest record (DCR): for each synthetic patient-day, the distance to the nearest real patient-day
+(standardized). Compare with real patient-days' distance to their nearest *other* real patient-day: if synthetic rows
+are much closer than that, the generator is copying.
+
+```{r S_pMSE}
+utility_vars <- c("Days_since_bio", key_vars, covs, "resp_class_final")
+
+# synthpop needs data.frames with factors
+prep <- function(db) {
+  as.data.frame(db[utility_vars]) %>%
+    mutate(sex_birth = factor(sex_birth),
+           on_any_steroid = factor(on_any_steroid),
+           resp_class_final = factor(resp_class_final))
+}
+
+ug <- utility.gen(prep(corsano_syn), prep(corsano_real), method = "cart", print.flag = FALSE)
+cat("S_pMSE:", round(ug$S_pMSE, 2), "\n")
+```
+
+```{r distance to closest record}
+# patient-days with no missing values: day, age, BMI, wearable variables
+dcr_matrix <- function(db) {
+  db %>%
+    select(Days_since_bio, age_at_enrollment, bmi, all_of(key_vars)) %>%
+    na.omit() %>%
+    as.matrix()
+}
+real_m <- dcr_matrix(corsano_real)
+syn_m  <- dcr_matrix(corsano_syn)
+
+# standardize both with the real means and SDs
+centre <- colMeans(real_m)
+scl    <- apply(real_m, 2, sd)
+real_m <- scale(real_m, centre, scl)
+syn_m  <- scale(syn_m, centre, scl)
+
+# distance from each row of 'from' to its nearest row of 'to'
+nearest_dist <- function(from, to, same = FALSE) {
+  map_dbl(seq_len(nrow(from)), function(i) {
+    d <- sqrt(colSums((t(to) - from[i, ])^2))   # distance to every row of 'to'
+    if (same) d[i] <- Inf                        # real vs real: skip itself
+    min(d)
+  })
+}
+
+dcr <- bind_rows(tibble(type = "Synthetic to nearest real",  dist = nearest_dist(syn_m, real_m)),
+                 tibble(type = "Real to nearest other real", dist = nearest_dist(real_m, real_m, same = TRUE)))
+
+dcr_summary <- dcr %>%
+  group_by(type) %>%
+  summarise(n = n(),
+            pct_exact_copy = round(100 * mean(dist < 1e-8), 2),   # distance 0 = copied row
+            q05 = quantile(dist, 0.05),
+            median = median(dist),
+            .groups = "drop")
+print(dcr_summary)
+```
+
+```{r dcr plot}
+p_dcr <- ggplot(dcr, aes(x = dist, colour = type)) +
+  geom_density(linewidth = 0.8) +
+  xlab("Distance to closest record (standardized)") +
+  ylab("Density") +
+  theme_minimal() +
+  theme(legend.position = "bottom", legend.title = element_blank())
+p_dcr
+```
+
+
+## 11. Summary
+
+```{r summary}
+summary_table <- tribble(
+  ~check, ~result, ~good_if,
+  "Days per patient (median), real / synthetic",
+    paste(day_summary$days_per_patient_median, collapse = " / "), "similar",
+  "Largest missing-% difference",
+    paste0(round(max(abs(missing_summary$Real - missing_summary$Synthetic)), 1), " points"), "< 5 points",
+  "Synthetic patients with exact real traits",
+    paste0(round(100 * exact_match, 1), "%"), "0%",
+  "Largest Spearman correlation difference",
+    as.character(round(max(abs(cor_diff)), 2)), "< 0.10",
+  "Variables where BIC picks the same knots",
+    paste0(sum(transfer_by_var$knots_real == transfer_by_var$knots_syn, na.rm = TRUE), " of ", length(key_vars)), "all",
+  "Estimated means: median CI overlap",
+    as.character(round(median(transfer_by_var$emmean_ci_overlap, na.rm = TRUE), 2)), "near 1",
+  "Non-Responder vs Responder: same significance call",
+    paste0(round(100 * mean(transfer_by_var$between_decision_agree, na.rm = TRUE)), "%"), "high",
+  "Within-class change: same significance call",
+    paste0(round(100 * mean(transfer_by_var$within_decision_agree, na.rm = TRUE)), "%"), "high",
+  "Covariates: same significance call",
+    paste0(round(100 * mean(covariate_compare$same_decision)), "%"), "high",
+  "S_pMSE",
+    as.character(round(ug$S_pMSE, 2)), "< 10",
+  "Synthetic patient-days that copy a real one exactly",
+    paste0(dcr_summary$pct_exact_copy[dcr_summary$type == "Synthetic to nearest real"], "%"), "0%"
+)
+knitr::kable(summary_table)
+
+write_csv(summary_table, file.path(results.dir, "PART_2_summary.csv"))
+```

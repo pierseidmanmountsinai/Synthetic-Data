@@ -1,0 +1,5 @@
+Error in abs_path(input) : 
+  The file 'C:/Users/seidmp03/OneDrive - The Mount Sinai Hospital/Synthetic Data/Claude outputs/PART_2_Synthetic_Data_Assessment_Sequential.Rmd' does not exist.
+In addition: Warning message:
+In normalizePath(path.expand(path), winslash, mustWork) :
+  path[1]="C:/Users/seidmp03/OneDrive - The Mount Sinai Hospital/Synthetic Data/Claude outputs/PART_2_Synthetic_Data_Assessment_Sequential.Rmd": The system cannot find the file specified

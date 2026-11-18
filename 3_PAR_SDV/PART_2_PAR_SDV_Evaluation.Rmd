@@ -1,0 +1,290 @@
+---
+title: "PART 2 - PAR Synthetic Data, SDV Evaluation (daily Corsano data)"
+author: "Piers Seidman"
+date: "2026-11-18"
+output: html_document
+---
+
+Generates one synthetic version of the daily Corsano data with SDV's PARSynthesizer (PART 1 PAR), then evaluates it
+with the tests and plots that come with SDV / SDMetrics only:
+
+1. Real data
+2. Generate synthetic data
+3. SDV metadata
+4. Diagnostic report (`run_diagnostic`): is the synthetic data valid and structured like the real data?
+5. Quality report (`evaluate_quality`): column shapes and column pair trends
+6. Column plots (`get_column_plot`): real vs synthetic distribution of each variable
+7. Column pair plots (`get_column_pair_plot`): real vs synthetic for each pair of wearable variables
+8. Detection (`LogisticDetection`, `LSTMDetection`): can a classifier tell real from synthetic, by day and by patient?
+9. Privacy (`DCRBaselineProtection`): are synthetic days closer to real days than random data would be?
+
+Scores are 0-1; higher is better for all of them.
+Not used: `get_cardinality_plot` (only for linked parent/child tables) and the metrics that need a held-out set of real
+patients or a choice of sensitive columns (`DCROverfittingProtection`, `DisclosureProtection`).
+
+
+```{r libraries, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+library(reticulate)
+py_require(packages = "sdv==2.2.0", python_version = "3.12")   # CHANGED: pinned to the tested version; SDV (with SDMetrics); must run before Python starts
+sdv_metadata   <- import("sdv.metadata")                   # describes the table for SDV
+sdv_evaluation <- import("sdv.evaluation")                 # run_diagnostic(), evaluate_quality(), plots
+sdm_single     <- import("sdmetrics.single_table")         # LogisticDetection, DCRBaselineProtection
+sdm_timeseries <- import("sdmetrics.timeseries")           # LSTMDetection
+
+library(tidyverse)     # dplyr, purrr, readr
+library(htmltools)     # show SDV's (plotly) figures in the html
+```
+
+
+```{r directories}
+main.dir    <- "C:/Users/seidmp03/OneDrive - The Mount Sinai Hospital/Synthetic Data"
+data_file   <- "H:/WearableBiologicsJJ/Data_for_Analysis/Daily_Final_DB_With_Response_Class.rda"   # real data
+par.dir     <- file.path(main.dir, "3_PAR_SDV")                                               # folder holding the PAR files   # CHANGED: was "Claude outputs"
+part1_file  <- file.path(par.dir, "PART_1_PAR_Generator.Rmd")                                       # generator code
+results.dir <- file.path(par.dir, "PART_2_PAR_SDV_Evaluation")                                      # outputs of this file
+dir.create(file.path(results.dir, "Plots"), recursive = TRUE, showWarnings = FALSE)
+```
+
+
+```{r settings}
+seed_to_assess <- 1   # generator seed
+
+key_vars <- c("Core_Body_Temperature_daily", "Skin_Contact_Temperature_daily", "respiration_daily",
+              "hrvAnalysis_sdnn_daily", "hrvAnalysis_rmssd_daily", "hrvAnalysis_min_hr_daily", "hrvAnalysis_mean_hr_daily")
+covs     <- c("age_at_enrollment", "sex_birth", "bmi", "on_any_steroid")   # PART 4 covariates
+traits   <- c("resp_class_final", "sex_birth", "age_at_enrollment", "bmi")  # constant within patient
+```
+
+
+```{r load generator}
+# Load the generator function from PART 1 PAR
+rmd <- readLines(part1_file)
+
+# pull the code of one chunk by its label
+chunk_code <- function(label) {
+  start <- grep(paste0("^```\\{r ", label), rmd)   # line where the chunk opens
+  end   <- grep("^```\\s*$", rmd)                  # all lines that close a chunk
+  end   <- end[end > start][1]                     # first close after the open
+  rmd[(start + 1):(end - 1)]                       # code between them
+}
+
+eval(parse(text = chunk_code("generator-par")), envir = globalenv())
+```
+
+
+```{r plot helper}
+# show an SDV (plotly) figure in the html and save it as its own html file
+plotly_js_added <- FALSE   # plotly's javascript goes into the html once, with the first figure
+show_fig <- function(fig, name) {
+  fig$write_html(file.path(results.dir, "Plots", paste0(name, ".html")))
+  out <- HTML(fig$to_html(full_html = FALSE, include_plotlyjs = !plotly_js_added))
+  plotly_js_added <<- TRUE
+  out
+}
+```
+
+
+## 1. Real data
+
+```{r load data}
+load(data_file)
+
+corsano_real <- Daily_Corsano_DB_ADJ_Response %>%
+  select(participant_id, Days_since_bio, all_of(key_vars), all_of(covs), resp_class_final) %>%
+  mutate(participant_id = as.character(participant_id))   # ID as text (SDV id column)
+
+cat("Real data:", n_distinct(corsano_real$participant_id), "patients,", nrow(corsano_real), "patient-days\n")
+```
+
+
+## 2. Generate synthetic data
+
+PAR trained once on the real data; one synthetic dataset with as many patients as the real data.
+**DATA CHANGES (generator input only):** `participant_id` as text; `on_any_steroid` modelled as a category (0/1).
+Values are not changed.
+
+```{r generate}
+corsano_syn <- generate_synthetic_par(corsano_real,
+                                      id_var = "participant_id",
+                                      time_var = "Days_since_bio",
+                                      context_vars = traits,                 # resp class, sex, age, BMI
+                                      categorical_vars = "on_any_steroid",
+                                      epochs = 128,
+                                      seed = seed_to_assess)
+
+saveRDS(corsano_syn, file.path(results.dir, paste0("corsano_PAR_seed_", seed_to_assess, ".rds")))   # for reference
+
+cat("Synthetic data:", n_distinct(corsano_syn$participant_id), "patients,", nrow(corsano_syn), "patient-days\n")
+```
+
+
+## 3. SDV metadata
+
+Column types, which column is the patient (sequence key) and which is time (sequence index); same as inside the generator.
+
+```{r metadata}
+real_py <- r_to_py(as.data.frame(corsano_real))
+syn_py  <- r_to_py(as.data.frame(corsano_syn))
+
+metadata <- sdv_metadata$Metadata$detect_from_dataframes(data = dict(corsano = real_py))
+metadata$update_column(column_name = "participant_id", sdtype = "id", table_name = "corsano")
+metadata$set_sequence_key(column_name = "participant_id", table_name = "corsano")
+metadata$set_sequence_index(column_name = "Days_since_bio", table_name = "corsano")
+metadata$update_column(column_name = "on_any_steroid", sdtype = "categorical", table_name = "corsano")
+
+metadata_dict <- metadata$to_dict()   # same metadata as a dictionary (SDMetrics metrics take this form)
+```
+
+
+## 4. Diagnostic report
+
+Data validity (IDs unique per patient, values within the real range, right type) and data structure (same columns).
+Each should be 1 (100%).
+
+```{r diagnostic}
+diagnostic_report <- sdv_evaluation$run_diagnostic(real_data = real_py,
+                                                   synthetic_data = syn_py,
+                                                   metadata = metadata)
+
+diagnostic_report$get_properties()
+diagnostic_report$get_details(property_name = "Data Validity")    # per column
+diagnostic_report$get_details(property_name = "Data Structure")
+```
+
+```{r diagnostic plot}
+show_fig(diagnostic_report$get_visualization(property_name = "Data Validity", table_name = "corsano"), "diagnostic_data_validity")
+```
+
+
+## 5. Quality report
+
+* **Column Shapes:** per variable, 1 − KS statistic (numeric) or 1 − total variation distance (categorical)
+* **Column Pair Trends:** per pair, 1 − ½ |real correlation − synthetic correlation| (numeric) or contingency
+  similarity (categorical)
+
+Rows are treated as independent patient-days; within-patient structure is not part of this report.
+
+```{r quality}
+quality_report <- sdv_evaluation$evaluate_quality(real_data = real_py,
+                                                  synthetic_data = syn_py,
+                                                  metadata = metadata)
+
+quality_report$get_score()
+quality_report$get_properties()
+```
+
+```{r quality details}
+shapes <- quality_report$get_details(property_name = "Column Shapes")         # per variable
+pairs  <- quality_report$get_details(property_name = "Column Pair Trends")    # per pair of variables
+
+print(as.data.frame(shapes %>% arrange(Score)), digits = 3)
+print(as.data.frame(pairs %>% arrange(Score)), digits = 3)
+
+write_csv(shapes, file.path(results.dir, "quality_column_shapes.csv"))
+write_csv(pairs,  file.path(results.dir, "quality_column_pair_trends.csv"))
+```
+
+```{r quality plots}
+tagList(
+  show_fig(quality_report$get_visualization(property_name = "Column Shapes", table_name = "corsano"), "quality_column_shapes"),
+  show_fig(quality_report$get_visualization(property_name = "Column Pair Trends", table_name = "corsano"), "quality_column_pair_trends")
+)
+```
+
+
+## 6. Column plots
+
+Real vs synthetic distribution of each variable (all patient-days).
+
+```{r column plots}
+plot_cols <- c("Days_since_bio", key_vars, covs, "resp_class_final")
+
+map(plot_cols, function(v) {
+  fig <- sdv_evaluation$get_column_plot(real_data = dict(corsano = real_py),
+                                        synthetic_data = dict(corsano = syn_py),
+                                        metadata = metadata,
+                                        table_name = "corsano",
+                                        column_name = v)
+  show_fig(fig, paste0("column_", v))
+}) %>%
+  tagList()
+```
+
+
+## 7. Column pair plots
+
+Real vs synthetic for each pair of the 7 wearable variables (scatter of patient-days).
+
+```{r column pair plots}
+var_pairs <- combn(key_vars, 2, simplify = FALSE)   # all 21 pairs
+
+map(var_pairs, function(p) {
+  fig <- sdv_evaluation$get_column_pair_plot(real_data = dict(corsano = real_py),
+                                             synthetic_data = dict(corsano = syn_py),
+                                             metadata = metadata,
+                                             table_name = "corsano",
+                                             column_names = as.list(p))
+  show_fig(fig, paste0("pair_", p[1], "__", p[2]))
+}) %>%
+  tagList()
+```
+
+
+## 8. Detection
+
+A classifier tries to tell real from synthetic; score = 1 − ROC AUC (cross-validated).
+1 = cannot tell them apart; 0 = always can.
+
+* **LogisticDetection:** one patient-day at a time
+* **LSTMDetection:** whole patient sequences (the longitudinal test)
+
+```{r detection}
+detection <- tibble(
+  metric = c("LogisticDetection (patient-days)", "LSTMDetection (patient sequences)"),
+  score = c(
+    sdm_single$LogisticDetection$compute(real_data = real_py, synthetic_data = syn_py,
+                                         metadata = metadata_dict, table_name = "corsano"),
+    sdm_timeseries$LSTMDetection$compute(real_data = real_py, synthetic_data = syn_py,
+                                         metadata = metadata_dict, table_name = "corsano",
+                                         sequence_key = list("participant_id"))
+  )
+)
+detection
+```
+
+
+## 9. Privacy
+
+**DCRBaselineProtection:** distance from each synthetic patient-day to the closest real one, compared with the same
+distance for random data drawn over the real ranges. 1 = synthetic days are as far from real days as random data;
+near 0 = synthetic days sit on top of real ones.
+
+```{r privacy}
+dcr <- sdm_single$DCRBaselineProtection$compute_breakdown(real_data = real_py,
+                                                          synthetic_data = syn_py,
+                                                          metadata = metadata_dict,
+                                                          table_name = "corsano")
+dcr
+```
+
+
+## 10. Summary
+
+```{r summary}
+summary_table <- tribble(
+  ~check, ~score,
+  "Diagnostic: data validity",                 diagnostic_report$get_properties()$Score[1],
+  "Diagnostic: data structure",                diagnostic_report$get_properties()$Score[2],
+  "Quality: overall",                          quality_report$get_score(),
+  "Quality: column shapes",                    quality_report$get_properties()$Score[1],
+  "Quality: column pair trends",               quality_report$get_properties()$Score[2],
+  "Detection: patient-days (LogisticDetection)", detection$score[1],
+  "Detection: patient sequences (LSTMDetection)", detection$score[2],
+  "Privacy: DCRBaselineProtection",            dcr$score
+) %>%
+  mutate(score = round(score, 3))
+knitr::kable(summary_table)
+
+write_csv(summary_table, file.path(results.dir, "PART_2_PAR_SDV_summary.csv"))
+```

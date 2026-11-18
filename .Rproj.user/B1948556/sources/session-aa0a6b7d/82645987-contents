@@ -1,0 +1,143 @@
+library(reticulate); py_require(python_version = "3.12")   # must run before keras3 on Windows
+suppressPackageStartupMessages({
+  library(keras3); library(tidyverse); library(car)
+  library(lme4); library(splines); library(synthpop); library(survival)
+})
+part1_file <- "PART_1_Synthetic_Data_Generator.Rmd"
+data_dir   <- "PART_3_Validation_Data"
+out_file   <- "PART_3_Validation_Data/vae_validation_results.rds"
+seeds <- 1:5; boots <- 1:5
+
+# ---- Generator: the frozen PART 1 chunks, loaded unchanged ----
+rmd <- readLines(part1_file)
+chunk_code <- function(label) {
+  start <- grep(paste0("^```\\{r ", label), rmd)
+  end <- grep("^```\\s*$", rmd); end <- end[end > start][1]
+  rmd[(start + 1):(end - 1)]
+}
+walk(c("generator-main", "generator-model", "generator-helpers"), ~ eval(parse(text = chunk_code(.x)), envir = globalenv()))
+
+# ---- Datasets. DATA CHANGES (test only): time binned to a grid; one visit kept per patient and bin;
+#      codes made factors; event/derived columns dropped ----
+e <- new.env(); load(file.path(data_dir, "paquid.rda"), e); load(file.path(data_dir, "aids.rda"), e)
+
+
+
+datasets <- list(
+  pbc = list(   # Mayo PBC trial, labs at irregular visits; time = half-years since entry
+    data = pbcseq %>%
+      transmute(patient_id = id, t = round(day / 182.625), trt = factor(trt), sex = factor(sex), age,
+                bili, albumin, alk.phos, ast, platelet, protime, chol,
+                ascites = factor(ascites), hepato = factor(hepato), spiders = factor(spiders), edema = factor(edema)),
+    cond_vars = c("trt", "sex", "age"), tv_cond_vars = NULL,
+    model = function(d, df) lmer(log(bili) ~ trt * ns(t, df) + age + sex + (t | patient_id), d, REML = FALSE)),
+  paquid = list(   # PAQUID ageing cohort, cognitive tests; time = years since entry
+    data = e$paquid %>%
+      transmute(patient_id = ID, t = round(age - age_init), MMSE, BVRT, IST, CESD,
+                CEP = factor(CEP), male = factor(male), age_init),
+    cond_vars = c("CEP", "male", "age_init"), tv_cond_vars = NULL,
+    model = function(d, df) lmer(MMSE ~ CEP * ns(t, df) + male + age_init + (t | patient_id), d, REML = FALSE)),
+  aids = list(   # ddI vs ddC trial, sqrt CD4 at months 0, 2, 6, 12, 18
+    data = e$aids %>%
+      transmute(patient_id = as.integer(patient), t = obstime, CD4, drug, gender, prevOI, AZT),
+    cond_vars = c("drug", "gender", "prevOI", "AZT"), tv_cond_vars = NULL,
+    model = function(d, df) lmer(CD4 ~ drug * ns(t, df) + gender + prevOI + AZT + (t | patient_id), d, REML = FALSE)),
+  wages = list(   # NLSY high-school dropouts, log wage; time = years of experience; GED is time-varying
+    data = read_csv(file.path(data_dir, "wages.csv"), show_col_types = FALSE) %>%
+      transmute(patient_id = id, t = round(exper), lnw, uerate, ged = factor(ged),
+                black = factor(black), hispanic = factor(hispanic), hgc),
+    cond_vars = c("black", "hispanic", "hgc"), tv_cond_vars = "ged",
+    model = function(d, df) lmer(lnw ~ black * ns(t, df) + hispanic + hgc + ged + uerate + (t | patient_id),
+                                 d, REML = FALSE)),
+  schizophrenia = list(   # NIMH schizophrenia trial, severity at weeks 0-6
+    data = read_csv(file.path(data_dir, "schizophrenia.csv"), show_col_types = FALSE) %>%
+      transmute(patient_id = id, t = Week, imps79, TxDrug = factor(TxDrug)),
+    cond_vars = "TxDrug", tv_cond_vars = NULL,
+    model = function(d, df) lmer(imps79 ~ TxDrug * ns(t, df) + (t | patient_id), d, REML = FALSE))
+) %>%
+  map(~ modify_in(.x, "data", function(d) d %>% distinct(patient_id, t, .keep_all = TRUE) %>% as_tibble()))
+
+# ---- Generate and resample ----
+generate <- function(ds, seed) {
+  generate_synthetic_temporal_vae(ds$data, seed = seed, verbose = 0, time_var = "t") %>%   # defaults only
+    mutate(across(where(is.character), ~ factor(.x, levels = levels(ds$data[[cur_column()]]))))
+}
+bootstrap <- function(d, seed) {
+  set.seed(1000 + seed)
+  ids <- sample(unique(d$patient_id), replace = TRUE)
+  map2_dfr(ids, seq_along(ids), ~ d %>% filter(patient_id == .x) %>% mutate(patient_id = .y))
+}
+
+# ---- Evaluation ----
+fit_safe <- function(model, d, df) tryCatch(suppressMessages(suppressWarnings(model(d, df))), error = function(e) NULL)
+best_df <- function(model, d) {
+  bic <- map_dbl(1:4, ~ { f <- fit_safe(model, d, .x); if (is.null(f)) NA else BIC(f) })
+  if (all(is.na(bic))) NA_integer_ else which.min(bic)
+}
+coef_table <- function(fit) {
+  if (is.null(fit)) return(NULL)
+  s <- summary(fit)$coefficients
+  tibble(term = rownames(s), est = s[, 1], lo = s[, 1] - 1.96 * s[, 2], hi = s[, 1] + 1.96 * s[, 2],
+         sig = abs(s[, 1] / s[, 2]) > 1.96)
+}
+ci_overlap <- function(l1, u1, l2, u2) {
+  ov <- pmax(0, pmin(u1, u2) - pmax(l1, l2))
+  (ov / (u1 - l1) + ov / (u2 - l2)) / 2
+}
+structure_stats <- function(d, ds) {
+  vars <- setdiff(names(ds$data), c("patient_id", "t"))
+  tibble(visits_median = median(table(d$patient_id)),
+         n_nan = sum(map_int(d[vars], ~ sum(is.nan(suppressWarnings(as.numeric(.x)))))), max_na_err = max(abs(colMeans(is.na(d[vars])) -
+                                                                          colMeans(is.na(ds$data[vars])))))
+}
+compare_to_original <- function(d, ds, orig_coefs, orig_df) {
+  fit <- fit_safe(ds$model, d, orig_df)
+  cf <- coef_table(fit)
+  base <- tibble(best_df = best_df(ds$model, d), fit_ok = !is.null(fit)) %>% bind_cols(structure_stats(d, ds))
+  if (is.null(cf)) return(base)
+  m <- inner_join(orig_coefs, cf, by = "term", suffix = c("_o", "_s")) %>% filter(term != "(Intercept)")
+  base %>% mutate(ci_overlap = mean(ci_overlap(m$lo_o, m$hi_o, m$lo_s, m$hi_s)),
+                  sign_agree = mean(sign(m$est_o) == sign(m$est_s)),
+                  decision_agree = mean(m$sig_o == m$sig_s))
+}
+row_utility <- function(d, ds) {
+  vars <- setdiff(names(ds$data), "patient_id")
+  prep <- function(x) as.data.frame(x[vars]) %>% rename(time_bin = t)   # synthpop uses "t" internally
+  ug <- tryCatch(utility.gen(prep(d), prep(ds$data), method = "cart",
+                             print.flag = FALSE), error = function(e) NULL)
+  if (is.null(ug)) NA_real_ else ug$S_pMSE
+}
+
+run_dataset <- function(name) {
+  ds <- datasets[[name]]
+  orig_df <- best_df(ds$model, ds$data)
+  orig_coefs <- coef_table(fit_safe(ds$model, ds$data, orig_df))
+  syn <- map(seeds, ~ tryCatch(generate(ds, .x), error = function(e) e))
+  syn_res <- map2_dfr(syn, seeds, function(d, s) {
+    if (inherits(d, "error")) return(tibble(source = "synthetic", rep = s, error = conditionMessage(d)))
+    compare_to_original(d, ds, orig_coefs, orig_df) %>% mutate(source = "synthetic", rep = s, S_pMSE = row_utility(d, ds))
+  })
+  boot_res <- map_dfr(boots, ~ compare_to_original(bootstrap(ds$data, .x), ds, orig_coefs, orig_df) %>%
+                        mutate(source = "bootstrap", rep = .x))
+  cat(name, "done\n")
+  list(results = bind_rows(syn_res, boot_res) %>% mutate(dataset = name, orig_df = orig_df),
+       synthetic = syn)
+}
+
+all_runs <- map(set_names(names(datasets)), run_dataset)
+results <- map_dfr(all_runs, "results")
+summary_tbl <- results %>%
+  group_by(dataset, source) %>%
+  summarise(n_ok = sum(fit_ok, na.rm = TRUE), orig_df = first(orig_df),
+            picks_orig_df = mean(best_df == orig_df, na.rm = TRUE),
+            across(any_of(c("ci_overlap", "sign_agree", "decision_agree", "S_pMSE", "max_na_err", "n_nan", "visits_median")),
+                   ~ mean(.x, na.rm = TRUE)), .groups = "drop")
+options(width = 200)
+print(as.data.frame(summary_tbl), digits = 3)
+data_overview <- map_dfr(datasets, ~ tibble(patients = n_distinct(.x$data$patient_id), rows = nrow(.x$data),
+                                            grid = n_distinct(.x$data$t), visits_median = median(table(.x$data$patient_id)),
+                                            max_na = max(colMeans(is.na(.x$data))), vars = ncol(.x$data) - 2), .id = "dataset")
+print(as.data.frame(data_overview))
+if ("error" %in% names(results)) print(results %>% filter(!is.na(error)) %>% distinct(dataset, error))
+saveRDS(list(results = results, summary = summary_tbl, overview = data_overview,
+             synthetic = map(all_runs, "synthetic")), out_file)

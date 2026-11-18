@@ -1,0 +1,305 @@
+---
+title: "PART 2 - PAR Synthetic Data, Model Comparison (daily Corsano data)"
+author: "Piers Seidman"
+date: "2026-11-18"
+output: html_document
+---
+
+Do the PART 4 models (`Model4WearablesV2_DailyMeans()`) give the same results on the PAR synthetic data as on the real
+data? Uses the same synthetic dataset that `PART_2_PAR_SDV_Evaluation.Rmd` evaluated (read from its saved file), so
+the SDV scores and these model results describe the same data. No Python needed.
+
+1. Real data
+2. Synthetic data: same patients per response class?
+3. Run the PART 4 models on both
+4. Same knots, estimated means, Non-Responder vs Responder and within-class calls?
+5. Covariate effects
+6. Plot: estimated means with 95% CIs, real vs synthetic
+7. Plot: covariate effects with 95% CIs, real vs synthetic
+8. Summary
+
+
+```{r libraries, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+library(tidyverse)     # dplyr, tidyr, purrr, ggplot2
+
+# Models (PART 4 function)
+library(nlme)          # Linear mixed-effects models
+library(splines)       # Natural cubic splines ns()
+library(emmeans)       # Marginal means & contrasts
+library(weights)       # starmaker() inside the PART 4 function
+library(performance)   # check_model() inside the PART 4 function
+library(openxlsx)      # Excel output inside the PART 4 function
+```
+
+
+```{r directories}
+main.dir    <- "C:/Users/seidmp03/OneDrive - The Mount Sinai Hospital/Synthetic Data"
+data_file   <- "H:/WearableBiologicsJJ/Data_for_Analysis/Daily_Final_DB_With_Response_Class.rda"   # real data
+part4_rmd   <- "H:/WearableBiologicsJJ/Code/PART_4_Daily_Spline_Models.Rmd"                         # Model4WearablesV2_DailyMeans()
+par.dir     <- file.path(main.dir, "Claude outputs")                                               # folder holding the PAR files
+results.dir <- file.path(par.dir, "PART_2_PAR_Model_Comparison")                                    # outputs of this file
+dir.create(results.dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+
+```{r settings}
+seed_to_assess <- 1   # generator seed (which saved PAR dataset to read)
+
+syn_file  <- file.path(par.dir, "PART_2_PAR_SDV_Evaluation", paste0("corsano_PAR_seed_", seed_to_assess, ".rds"))  # from the SDV evaluation
+real_file <- file.path(par.dir, "PART_2_PAR_Assessment", "Corsano_Models", "real_fits.rds")   # real PART 4 fits, if already saved
+
+key_vars <- c("Core_Body_Temperature_daily", "Skin_Contact_Temperature_daily", "respiration_daily",
+              "hrvAnalysis_sdnn_daily", "hrvAnalysis_rmssd_daily", "hrvAnalysis_min_hr_daily", "hrvAnalysis_mean_hr_daily")
+covs     <- c("age_at_enrollment", "sex_birth", "bmi", "on_any_steroid")   # PART 4 covariates
+max_days <- 98                                                               # same as PART 4
+```
+
+
+```{r load PART 4 function}
+# Load Model4WearablesV2_DailyMeans() from the PART 4 Rmd ("Updated Function" chunk), unchanged
+part4    <- readLines(part4_rmd)
+fn_start <- grep("^```\\{r Updated Function", part4)   # line where the chunk opens
+fn_end   <- grep("^```\\s*$", part4)                   # all lines that close a chunk
+fn_end   <- fn_end[fn_end > fn_start][1]               # first close after the open
+eval(parse(text = part4[(fn_start + 1):(fn_end - 1)]))
+```
+
+
+## 1. Real data
+
+```{r load data}
+load(data_file)
+
+corsano_real <- Daily_Corsano_DB_ADJ_Response %>%
+  select(participant_id, Days_since_bio, all_of(key_vars), all_of(covs), resp_class_final) %>%
+  mutate(participant_id = as.character(participant_id))   # same ID type as the synthetic data
+
+cat("Real data:", n_distinct(corsano_real$participant_id), "patients,", nrow(corsano_real), "patient-days\n")
+```
+
+
+## 2. Synthetic data
+
+The PAR dataset saved by `PART_2_PAR_SDV_Evaluation.Rmd` (knit that first).
+Every response class must be present, or its means and contrasts cannot be compared.
+
+```{r load synthetic}
+corsano_syn <- readRDS(syn_file)
+
+cat("Synthetic data:", n_distinct(corsano_syn$participant_id), "patients,", nrow(corsano_syn), "patient-days\n")
+```
+
+```{r patients per class}
+# patients per response class: real vs synthetic
+class_counts <- bind_rows(Real = corsano_real, Synthetic = corsano_syn, .id = "source") %>%
+  distinct(source, participant_id, resp_class_final) %>%
+  count(source, resp_class_final) %>%
+  pivot_wider(names_from = source, values_from = n, values_fill = 0)
+knitr::kable(class_counts)
+```
+
+
+## 3. Run the PART 4 models
+
+`Model4WearablesV2_DailyMeans()` is run unchanged on the real and the synthetic data (same call as PART 4).
+Each run writes its usual Excel file, plots and GOF plots to its own folder under `Corsano_Models/`.
+The real fits are read from the PAR assessment if it already saved them; otherwise they are fitted here and saved.
+
+```{r run PART 4 models, results = "hide", fig.show = "hide"}
+# run the PART 4 function on one dataset, in its own folder
+run_part4 <- function(d, label) {
+  res_dir <- file.path(results.dir, "Corsano_Models", label)
+  dir.create(res_dir, recursive = TRUE, showWarnings = FALSE)
+  res <- Model4WearablesV2_DailyMeans(db = d, vars2run = key_vars, time_column = "Days_since_bio",
+                                      resp_class = "resp_class_final", covs = covs,
+                                      max_days = max_days, results.dir = res_dir)
+  graphics.off()                                       # close devices left open if check_model() fails
+  res$results %>%
+    compact() %>%                                      # drop variables that failed
+    set_names(map_chr(., "variable"))
+}
+
+# real: fitted once and saved
+if (!file.exists(real_file)) {
+  real_file <- file.path(results.dir, "Corsano_Models", "real_fits.rds")
+  if (!file.exists(real_file)) saveRDS(run_part4(corsano_real, "Original"), real_file)
+}
+real_fits <- readRDS(real_file)
+
+# synthetic
+syn_fits <- run_part4(corsano_syn, paste0("PAR_seed_", seed_to_assess))
+```
+
+
+## 4. Knots, estimated means and significance calls
+
+Per variable:
+
+* **knots:** what BIC picks (real vs synthetic)
+* **emmean_ci_overlap:** median overlap of the bi-weekly estimated-mean CIs (1 = identical)
+* **between_decision_agree:** share of time points where Non-Responder vs Responder gets the same call (p < 0.05)
+* **within_decision_agree:** share of class × time points where change from day 0 gets the same call
+
+```{r compare helpers}
+# share of each CI covered by the other, averaged (1 = identical CIs)
+ci_overlap <- function(l1, u1, l2, u2) {
+  ov <- pmax(0, pmin(u1, u2) - pmax(l1, l2))
+  (ov / (u1 - l1) + ov / (u2 - l2)) / 2
+}
+
+# knots of the model BIC picked
+best_knots <- function(x) {
+  as.integer(gsub("knots", "", x$model_comparison$Model[which.min(x$model_comparison$BIC)]))
+}
+```
+
+```{r transfer by variable}
+transfer_by_var <- map_dfr(key_vars, function(v) {
+  r <- real_fits[[v]]
+  s <- syn_fits[[v]]
+  if (is.null(r) || is.null(s)) return(tibble(variable = v))   # model failed on one of them
+
+  # bi-weekly estimated means by class
+  m <- inner_join(r$results, s$results, by = c("time_var", "resp_class"), suffix = c("_r", "_s"))
+
+  # Non-Responder - Responder contrasts
+  b <- inner_join(r$between, s$between, by = c("time_var", "contrast"), suffix = c("_r", "_s"))
+
+  # within-class change from day 0
+  w <- m %>% filter(!is.na(p_within_r), !is.na(p_within_s))
+
+  tibble(variable = v,
+         knots_real = best_knots(r),
+         knots_syn = best_knots(s),
+         emmean_ci_overlap = median(ci_overlap(m$lower.CL_r, m$upper.CL_r, m$lower.CL_s, m$upper.CL_s)),
+         between_n = nrow(b),
+         between_decision_agree = if (nrow(b) > 0) mean((b$p_between_r < 0.05) == (b$p_between_s < 0.05)) else NA,
+         within_decision_agree = mean((w$p_within_r < 0.05) == (w$p_within_s < 0.05)))
+})
+print(as.data.frame(transfer_by_var), digits = 3)
+```
+
+```{r between calls}
+# Non-Responder - Responder at each time point: real vs synthetic p-values
+between_compare <- map_dfr(key_vars, function(v) {
+  if (is.null(real_fits[[v]]) || is.null(syn_fits[[v]])) return(tibble())
+  full_join(real_fits[[v]]$between %>% select(time_var, p_real = p_between),
+            syn_fits[[v]]$between %>% select(time_var, p_syn = p_between),
+            by = "time_var") %>%
+    mutate(variable = v, .before = 1,
+           same_decision = (p_real < 0.05) == (p_syn < 0.05))
+})
+print(as.data.frame(between_compare), digits = 3)
+```
+
+
+## 5. Covariate effects
+
+```{r covariate effects}
+# covariate coefficients (age, sex, BMI, steroid), real vs synthetic, per variable
+cov_terms <- function(x) {
+  tibble(term = names(fixef(x$model)),
+         est = unname(fixef(x$model)),
+         se = unname(sqrt(diag(vcov(x$model))))) %>%
+    filter(!grepl("resp_class|time_var|Intercept", term))   # covariates only
+}
+
+covariate_compare <- map_dfr(key_vars, function(v) {
+  if (is.null(real_fits[[v]]) || is.null(syn_fits[[v]])) return(tibble())
+  inner_join(cov_terms(real_fits[[v]]), cov_terms(syn_fits[[v]]), by = "term", suffix = c("_real", "_syn")) %>%
+    mutate(variable = v,
+           p_real = 2 * pnorm(-abs(est_real / se_real)),
+           p_syn  = 2 * pnorm(-abs(est_syn / se_syn)),
+           same_sign = sign(est_real) == sign(est_syn),
+           same_decision = (p_real < 0.05) == (p_syn < 0.05),
+           ci_overlap = ci_overlap(est_real - 1.96 * se_real, est_real + 1.96 * se_real,
+                                   est_syn - 1.96 * se_syn,   est_syn + 1.96 * se_syn))
+})
+print(as.data.frame(covariate_compare %>% select(variable, term, est_real, est_syn, p_real, p_syn,
+                                                 same_sign, same_decision, ci_overlap)), digits = 3)
+
+write_csv(covariate_compare, file.path(results.dir, "covariate_compare.csv"))
+```
+
+
+## 6. Plot: estimated means
+
+Bi-weekly estimated means with 95% CIs from the PART 4 models; rows = variable, columns = response class.
+
+```{r means plot, fig.width = 10, fig.height = 16}
+# real and synthetic estimated means stacked, one row per source
+means_plot_data <- map_dfr(key_vars, function(v) {
+  bind_rows(Real = real_fits[[v]]$results, Synthetic = syn_fits[[v]]$results, .id = "source") %>%
+    mutate(variable = gsub("hrvAnalysis_|_daily", "", v))   # short names for the panels
+})
+
+p_means <- ggplot(means_plot_data, aes(x = time_var, y = emmean, colour = source)) +
+  geom_line(position = position_dodge(5)) +
+  geom_point(size = 1.8, position = position_dodge(5)) +
+  geom_errorbar(aes(ymin = lower.CL, ymax = upper.CL), width = 0, position = position_dodge(5)) +
+  facet_grid(variable ~ resp_class, scales = "free_y") +
+  scale_x_continuous(breaks = seq(0, max_days, by = 14)) +
+  scale_colour_manual(values = c("Real" = "black", "Synthetic" = "darkorange")) +
+  xlab("Days Since Biologic Start") +
+  ylab("Estimated mean (95% CI)") +
+  labs(colour = NULL) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+p_means
+
+ggsave(file.path(results.dir, "means_real_vs_PAR.png"), p_means, width = 10, height = 16)
+```
+
+
+## 7. Plot: covariate effects
+
+```{r covariate plot, fig.width = 12, fig.height = 8}
+# real and synthetic coefficients stacked, one row per source
+cov_plot_data <- bind_rows(
+  Real = covariate_compare %>% select(variable, term, est = est_real, se = se_real),
+  Synthetic = covariate_compare %>% select(variable, term, est = est_syn, se = se_syn),
+  .id = "source") %>%
+  mutate(variable = gsub("hrvAnalysis_|_daily", "", variable))
+
+p_cov <- ggplot(cov_plot_data, aes(x = est, y = term, colour = source)) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey60") +
+  geom_point(position = position_dodge(0.5)) +
+  geom_errorbarh(aes(xmin = est - 1.96 * se, xmax = est + 1.96 * se), height = 0, position = position_dodge(0.5)) +
+  facet_wrap(~ variable, scales = "free_x") +
+  scale_colour_manual(values = c("Real" = "black", "Synthetic" = "darkorange")) +
+  xlab("Coefficient (95% CI)") +
+  ylab(NULL) +
+  labs(colour = NULL) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+p_cov
+
+ggsave(file.path(results.dir, "covariates_real_vs_PAR.png"), p_cov, width = 12, height = 8)
+```
+
+
+## 8. Summary
+
+```{r summary}
+summary_table <- tribble(
+  ~check, ~result, ~good_if,
+  "Variables where BIC picks the same knots",
+    paste0(sum(transfer_by_var$knots_real == transfer_by_var$knots_syn, na.rm = TRUE), " of ", length(key_vars)), "all",
+  "Estimated means: median CI overlap",
+    as.character(round(median(transfer_by_var$emmean_ci_overlap, na.rm = TRUE), 2)), "near 1",
+  "Non-Responder vs Responder: same significance call",
+    paste0(round(100 * mean(between_compare$same_decision, na.rm = TRUE)), "%"), "high",
+  "Within-class change: same significance call",
+    paste0(round(100 * mean(transfer_by_var$within_decision_agree, na.rm = TRUE)), "%"), "high",
+  "Covariates: same sign",
+    paste0(round(100 * mean(covariate_compare$same_sign)), "%"), "high",
+  "Covariates: same significance call",
+    paste0(round(100 * mean(covariate_compare$same_decision)), "%"), "high",
+  "Covariates: median CI overlap",
+    as.character(round(median(covariate_compare$ci_overlap), 2)), "near 1"
+)
+knitr::kable(summary_table)
+
+write_csv(summary_table, file.path(results.dir, "PART_2_PAR_model_summary.csv"))
+```
